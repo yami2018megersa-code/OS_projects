@@ -1,0 +1,21 @@
+# "one cook": the course menu on a single core.
+#
+# The textbook setting. Every decision is "who goes next", nothing overlaps
+# except the oven, and the classic algorithms behave exactly as the diagrams
+# say they do. Load is turned down to match.
+
+[kitchen]
+name = "one cook"
+cores = 1
+switch_cost = 2
+max_ticks = 2400
+
+[workload]
+arrival_window = 1600
+mean_interarrival = 14.0
+warmup_orders = 2
+
+[[workload.rush]]
+start = 600
+end = 1000
+multiplier = 2.0

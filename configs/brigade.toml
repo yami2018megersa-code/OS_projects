@@ -1,0 +1,55 @@
+# "brigade": four cooks and a full room.
+#
+# More cores than the classic diagrams assume, and enough custom to keep them
+# all busy. Balancing work across cooks, and not moving an order between them
+# for no reason, is what shows up here.
+
+[kitchen]
+name = "brigade"
+cores = 4
+switch_cost = 3
+max_ticks = 2400
+
+[workload]
+arrival_window = 1600
+mean_interarrival = 3.5
+warmup_orders = 6
+
+[[workload.rush]]
+start = 600
+end = 1000
+multiplier = 2.0
+
+# --- the stations --------------------------------------------------------------
+#
+# A place in the kitchen that only so many cooks fit at. A work step names the
+# station it happens at, and a cook holds one of that station's places for as
+# long as it holds the order - so a station is a lock with `capacity` permits,
+# and a scheduler here has to allocate places as well as cooks. An assignment
+# to an order whose station is full is refused, and `obs.stations` says which
+# ones have room.
+#
+# A cook only ever holds one station and always lets go before it takes the
+# next, so this kitchen cannot deadlock. It can starve and convoy, which is
+# the point.
+#
+# To turn contention off entirely, drop `station = ...` from every step and
+# put `station = []` on the first line of this file - a bare TOML key has to
+# come before the first [table]. Omitting this section does not do it: like
+# the menu, it falls back to the built-in one.
+
+[[station]]
+name = "board"
+capacity = 3
+label = "prep bench"
+
+[[station]]
+name = "pass"
+capacity = 2
+label = "the pass"
+
+[[station]]
+name = "bar"
+capacity = 1
+label = "bar"
+

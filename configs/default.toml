@@ -1,0 +1,203 @@
+# The course profile: "lunch service". The rules every run is marked under.
+#
+# This file spells out the engine's built-in defaults, so it hashes to the
+# same configuration as running with no file at all. Every value here that
+# changes what happens in the kitchen is part of the configuration hash, which
+# is what makes a result reproducible. Tune between cohorts, never mid-course.
+#
+# The model:
+#   a cook  = a CPU core
+#   an order = a process; its recipe is a sequence of bursts
+#   a work step = a CPU burst - needs a cook for every tick
+#   a wait step = an I/O burst - the dish is in the oven; the cook is free
+#   switch_cost = the context switch, paid whenever a cook takes on an order
+#   patience    = how long the customer waits before walking out
+
+[kitchen]
+name = "lunch service"
+cores = 2
+switch_cost = 2
+max_ticks = 2400
+# Presentation only: how long a tick is when the viewer plays at 1x.
+tick_ms = 100
+# Whether schedulers are told how long each step takes. See blind.toml.
+known_durations = true
+seed = 1234
+
+[workload]
+# Orders arrive from tick 1 up to this tick; after it, the kitchen drains.
+arrival_window = 1600
+# Mean ticks between arrivals outside a rush (one Bernoulli trial per tick).
+mean_interarrival = 8.0
+# Orders already on the rail when service opens.
+warmup_orders = 2
+# Hard cap on orders per run; zero for none.
+max_orders = 0
+
+[[workload.rush]]
+start = 600
+end = 1000
+multiplier = 2.0
+
+# --- the stations --------------------------------------------------------------
+#
+# A place in the kitchen that only so many cooks fit at. A work step names the
+# station it happens at, and a cook holds one of that station's places for as
+# long as it holds the order - so a station is a lock with `capacity` permits,
+# and a scheduler here has to allocate places as well as cooks. An assignment
+# to an order whose station is full is refused, and `obs.stations` says which
+# ones have room.
+#
+# A cook only ever holds one station and always lets go before it takes the
+# next, so this kitchen cannot deadlock. It can starve and convoy, which is
+# the point.
+#
+# To turn contention off entirely, drop `station = ...` from every step and
+# put `station = []` on the first line of this file - a bare TOML key has to
+# come before the first [table]. Omitting this section does not do it: like
+# the menu, it falls back to the built-in one.
+
+[[station]]
+name = "board"
+capacity = 2
+label = "prep bench"
+
+[[station]]
+name = "pass"
+capacity = 1
+label = "the pass"
+
+[[station]]
+name = "bar"
+capacity = 1
+label = "bar"
+
+# --- the menu ------------------------------------------------------------------
+#
+# priority: 1 a regular customer, 2 a hurried one, 3 a VIP. The engine does
+# nothing with it - what a scheduler does with it is up to the scheduler - but
+# completion by priority is reported.
+# patience: [min, max] ticks before the customer leaves.
+# steps:    label (for the viewer), kind (work or wait), ticks [min, max],
+#           and for a work step the station it happens at.
+
+[[recipe]]
+name = "espresso"
+weight = 5.0
+priority = 2
+patience = [30, 50]
+steps = [{ label = "pull", kind = "work", ticks = [1, 2], station = "bar" }]
+
+[[recipe]]
+name = "salad"
+weight = 4.0
+priority = 1
+patience = [120, 180]
+steps = [
+  { label = "chop", kind = "work", ticks = [5, 8], station = "board" },
+  { label = "dress", kind = "work", ticks = [2, 3], station = "pass" },
+]
+
+[[recipe]]
+name = "burger"
+weight = 4.0
+priority = 1
+patience = [150, 220]
+steps = [
+  { label = "shape", kind = "work", ticks = [3, 4], station = "board" },
+  { label = "grill", kind = "wait", ticks = [16, 24] },
+  { label = "assemble", kind = "work", ticks = [3, 5], station = "pass" },
+]
+
+[[recipe]]
+name = "soup"
+weight = 2.0
+priority = 1
+patience = [200, 300]
+steps = [
+  { label = "chop", kind = "work", ticks = [6, 9], station = "board" },
+  { label = "simmer", kind = "wait", ticks = [40, 60] },
+  { label = "ladle", kind = "work", ticks = [1, 2], station = "pass" },
+]
+
+[[recipe]]
+name = "roast"
+weight = 1.0
+priority = 1
+patience = [400, 600]
+steps = [
+  { label = "prep", kind = "work", ticks = [10, 14], station = "board" },
+  { label = "oven", kind = "wait", ticks = [80, 120] },
+  { label = "carve", kind = "work", ticks = [6, 8], station = "pass" },
+]
+
+[[recipe]]
+name = "banquet"
+weight = 1.0
+priority = 1
+patience = [500, 700]
+steps = [
+  { label = "prep", kind = "work", ticks = [40, 60], station = "board" },
+  { label = "plate", kind = "work", ticks = [10, 15], station = "pass" },
+]
+
+[[recipe]]
+name = "vip_tasting"
+weight = 1.0
+priority = 3
+patience = [90, 140]
+steps = [
+  { label = "prep", kind = "work", ticks = [8, 12], station = "board" },
+  { label = "rest", kind = "wait", ticks = [10, 16] },
+  { label = "plate", kind = "work", ticks = [4, 6], station = "pass" },
+]
+
+# --- scoring ---------------------------------------------------------------------
+#
+# Five components, each in [0, 1], combined by weight into a score out of 100.
+#   completion  served / orders
+#   response    1 / (1 + mean_response / response_scale), over orders a cook started
+#   slowdown    1 / mean(turnaround / max(work, slowdown_bound)), over served orders
+#   switching   necessary_switches / context_switches - the share of switches
+#               that started a fresh work step rather than resuming a preempted one
+#   fairness    Jain's index over the served orders' bounded slowdowns
+# Every raw metric is in the result too, so a course can re-rank on any of them.
+
+[scoring]
+# A mean response of this many ticks scores half marks on the response component.
+response_scale = 25.0
+# The same shape for turnaround. Set well above response_scale, because
+# turnaround counts every oven wait and every tick back on the rail, not just
+# the wait for a first cook.
+turnaround_scale = 60.0
+# Bounded slowdown: work shorter than this counts as this long, so a two-tick
+# espresso that waited ten ticks is not scored as a six-fold delay.
+slowdown_bound = 10.0
+
+# Six components, each in [0, 1]. They are divided by their own total before
+# the score is worked out, so these are ratios, not percentages - but they are
+# written to sum to 1 so the table reads as marks out of a hundred.
+#
+# response and turnaround are both latency, measured differently: response is
+# how long before anything happens, turnaround is how long the whole thing
+# took. slowdown is turnaround again, divided by the work in the order, so a
+# short job waiting is punished more than a long one waiting. A scheduler can
+# win one and lose another, which is why all three are here and none of them
+# carries the weight alone.
+[scoring.weights]
+completion = 0.30
+response = 0.125
+turnaround = 0.125
+slowdown = 0.15
+switching = 0.15
+fairness = 0.15
+
+# --- running somebody else's code ---------------------------------------------------
+# Not part of the configuration hash: it changes what happens to a misbehaving
+# scheduler, not what happens in the kitchen.
+
+[evaluation]
+per_decision_timeout_ms = 50.0
+max_consecutive_failures = 20
+max_debug_bytes = 8192
+replay_frame_interval = 1

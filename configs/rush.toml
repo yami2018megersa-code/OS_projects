@@ -1,0 +1,23 @@
+# "friday rush": more custom than two cooks can serve.
+#
+# Orders come faster and the rush is longer and heavier, so somebody is going
+# to walk out whatever the scheduler does. The question becomes *who*: the
+# scheduler that lets the two-tick espressos go cold while it finishes a
+# banquet loses many customers to save one. Completion, priority handling and
+# deadline awareness dominate here.
+
+[kitchen]
+name = "friday rush"
+cores = 2
+switch_cost = 2
+max_ticks = 2400
+
+[workload]
+arrival_window = 1600
+mean_interarrival = 6.0
+warmup_orders = 4
+
+[[workload.rush]]
+start = 400
+end = 1200
+multiplier = 2.5

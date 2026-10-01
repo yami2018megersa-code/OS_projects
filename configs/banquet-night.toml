@@ -1,0 +1,105 @@
+# "banquet night": long jobs in front of short ones - the convoy effect.
+#
+# Banquets are frequent and enormous; espressos are frequent and tiny. FIFO
+# parks a queue of two-tick espressos behind a sixty-tick banquet and every
+# one of them goes cold. Anything that looks at job length, or that preempts,
+# does far better. Switching is cheap here so that preemption is a real option
+# and the trade-off is about *when* to switch, not whether one can afford to.
+
+[kitchen]
+name = "banquet night"
+cores = 2
+switch_cost = 1
+max_ticks = 2400
+
+[workload]
+arrival_window = 1600
+mean_interarrival = 7.0
+warmup_orders = 2
+
+[[workload.rush]]
+start = 500
+end = 900
+multiplier = 1.6
+
+# --- the stations --------------------------------------------------------------
+#
+# A place in the kitchen that only so many cooks fit at. A work step names the
+# station it happens at, and a cook holds one of that station's places for as
+# long as it holds the order - so a station is a lock with `capacity` permits,
+# and a scheduler here has to allocate places as well as cooks. An assignment
+# to an order whose station is full is refused, and `obs.stations` says which
+# ones have room.
+#
+# A cook only ever holds one station and always lets go before it takes the
+# next, so this kitchen cannot deadlock. It can starve and convoy, which is
+# the point.
+#
+# To turn contention off entirely, drop `station = ...` from every step and
+# put `station = []` on the first line of this file - a bare TOML key has to
+# come before the first [table]. Omitting this section does not do it: like
+# the menu, it falls back to the built-in one.
+
+[[station]]
+name = "board"
+capacity = 2
+label = "prep bench"
+
+[[station]]
+name = "pass"
+capacity = 1
+label = "the pass"
+
+[[station]]
+name = "bar"
+capacity = 1
+label = "bar"
+
+[[recipe]]
+name = "espresso"
+weight = 8.0
+priority = 2
+patience = [25, 40]
+steps = [{ label = "pull", kind = "work", ticks = [1, 2], station = "bar" }]
+
+[[recipe]]
+name = "salad"
+weight = 3.0
+priority = 1
+patience = [100, 160]
+steps = [
+  { label = "chop", kind = "work", ticks = [4, 7], station = "board" },
+  { label = "toss", kind = "work", ticks = [2, 3], station = "pass" },
+]
+
+[[recipe]]
+name = "banquet"
+weight = 3.0
+priority = 1
+patience = [450, 650]
+steps = [
+  { label = "prep", kind = "work", ticks = [40, 60], station = "board" },
+  { label = "plate", kind = "work", ticks = [10, 15], station = "pass" },
+]
+
+[[recipe]]
+name = "roast"
+weight = 1.0
+priority = 1
+patience = [400, 600]
+steps = [
+  { label = "prep", kind = "work", ticks = [10, 14], station = "board" },
+  { label = "oven", kind = "wait", ticks = [80, 120] },
+  { label = "carve", kind = "work", ticks = [6, 8], station = "pass" },
+]
+
+[[recipe]]
+name = "vip_tasting"
+weight = 1.0
+priority = 3
+patience = [90, 140]
+steps = [
+  { label = "prep", kind = "work", ticks = [8, 12], station = "board" },
+  { label = "rest", kind = "wait", ticks = [10, 16] },
+  { label = "plate", kind = "work", ticks = [4, 6], station = "pass" },
+]

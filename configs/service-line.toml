@@ -1,0 +1,52 @@
+# "service line": four cooks, one pass.
+#
+# The profile for teaching resource contention. There is plenty of bench, so
+# work is never short - but every order has to be plated, and there is exactly
+# one place at the pass. That one station is the constraint the whole kitchen
+# runs at, and a scheduler that ignores it will keep three cooks idle waiting
+# for the fourth to finish plating.
+#
+# What it rewards: keeping the bottleneck fed, and not letting four cooks all
+# reach a plating step at the same moment. Classic bottleneck scheduling -
+# and exactly the shape of a lock every thread has to take before it can
+# finish.
+
+[kitchen]
+name = "service line"
+cores = 4
+switch_cost = 2
+max_ticks = 2400
+tick_ms = 100
+known_durations = true
+seed = 1234
+
+[workload]
+arrival_window = 1600
+mean_interarrival = 4.5
+warmup_orders = 4
+max_orders = 0
+
+[[workload.rush]]
+start = 600
+end = 1000
+multiplier = 1.6
+
+# --- the stations --------------------------------------------------------------
+#
+# Room for everybody at the bench, one place at the pass. See default.toml for
+# what a station is and how a step names one.
+
+[[station]]
+name = "board"
+capacity = 4
+label = "prep bench"
+
+[[station]]
+name = "pass"
+capacity = 1
+label = "the pass"
+
+[[station]]
+name = "bar"
+capacity = 2
+label = "bar"

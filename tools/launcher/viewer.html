@@ -1,0 +1,3232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Short Order · replay viewer</title>
+<!--
+  Short Order replay viewer
+  =========================
+  A single-file, dependency-free browser viewer for kitchen replays produced by
+  the sim-core engine (sim-core/src/replay.rs). The page is served by
+  tools/launcher/server.py and opened as
+
+      viewer.html?replay=<file.rep>&speed=<n>       (fetches api/replay?name=<file.rep>)
+      /viewer.html?src=<url>                        (fetches a raw JSON document)
+
+  The file is organised in two halves:
+
+    1. PURE FUNCTIONS (no DOM): palette, replay indexing, frame lookup,
+       interpolation, Gantt precompute, rail ordering, event wording. These are
+       exported on `ShortOrder` (and `module.exports` under Node) so they can be
+       unit-tested headlessly with `node`.
+    2. THE VIEWER (DOM + canvas): loading, playback, drawing, controls. Started by
+       `boot()` only when a `document` exists.
+
+  Domain reminder: cooks are CPU cores, orders are processes, a `work` step is a
+  CPU burst, a `wait` step is an I/O burst (the dish sits in the oven and the
+  cook is free), a context switch is the cook walking to the rail for a ticket.
+-->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='15' fill='%23fdf4e6'/%3E%3Cpath d='M9 13h14v3.4a7 7 0 0 1-14 0z' fill='%23e0714b'/%3E%3Cpath d='M8.6 11.6h14.8v2.2H8.6z' fill='%23fffdf8'/%3E%3Ccircle cx='12' cy='9' r='2.6' fill='%23fffdf8'/%3E%3Ccircle cx='16' cy='7.4' r='3' fill='%23fffdf8'/%3E%3Ccircle cx='20' cy='9' r='2.6' fill='%23fffdf8'/%3E%3Ccircle cx='12.6' cy='19.4' r='1.1' fill='%23fffdf8'/%3E%3Ccircle cx='19.4' cy='19.4' r='1.1' fill='%23fffdf8'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<!-- Rounded display type. Loaded without blocking the first paint - the
+     `media` swap is what does that - because a lab machine with no network
+     must not wait on fonts.googleapis.com to draw the page. The CSS below
+     names a full system fallback stack, so offline it still looks like
+     itself. -->
+<link rel="stylesheet" media="print" onload="this.media='all'"
+      href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;600;700;800&family=Nunito:wght@400;500;600;700;800&display=swap">
+<style>
+:root {
+  /* --- warm cream cafe -------------------------------------------------------
+     The same tokens as the launcher and the arena. Canvas cannot read custom
+     properties, so the kitchen and the timeline carry the same colours again as
+     literals in their drawing code; the two are kept in step by hand. */
+  --bg: #fdf4e6; --panel: #fffdf8; --panel-2: #f9eeda; --edge: #eddcc0; --edge-2: #e0c8a4;
+  --text: #4a3728; --muted: #8a7461; --good: #2f8055; --bad: #c4443c;
+  --warn: #a06c00; --accent: #e0714b; --accent-ink: #c1552f; --butter: #f5c451;
+  --shadow: 0 2px 0 #f0dfc4, 0 8px 20px rgba(176, 132, 90, .12);
+  --font: "Nunito", ui-rounded, "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-display: "Baloo 2", "Nunito", ui-rounded, "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+  --r: 16px; --r-sm: 11px;
+}
+* { box-sizing: border-box; }
+/* The `hidden` attribute is honoured by a UA rule of the lowest possible
+   precedence, so any author rule that sets `display` beats it. Several panels
+   here are laid out with `display: flex`, which silently made `el.hidden =
+   true` do nothing - the end-of-run overlay was drawn from page load and its
+   close button could not dismiss it. Stated once, loudly, so that toggling
+   `.hidden` in JavaScript means what it says everywhere on this page. */
+[hidden] { display: none !important; }
+html, body {
+  margin: 0; color: var(--text);
+  background:
+    repeating-linear-gradient(90deg, rgba(224, 113, 75, .035) 0 24px, transparent 24px 48px),
+    repeating-linear-gradient(0deg, rgba(224, 113, 75, .035) 0 24px, transparent 24px 48px),
+    var(--bg);
+  font: 14.5px/1.45 var(--font);
+  overflow-x: hidden;
+}
+button, select, input { font: inherit; color: inherit; }
+button {
+  background: var(--panel); border: 2px solid var(--edge-2); border-radius: 999px;
+  padding: 6px 15px; cursor: pointer; min-height: 34px; font-weight: 700;
+  box-shadow: 0 2px 0 var(--edge-2); transition: transform .1s, box-shadow .1s, border-color .12s;
+}
+button:hover { border-color: var(--accent); box-shadow: 0 3px 0 #f0c8b4; transform: translateY(-1px); }
+button:active { transform: translateY(1px); box-shadow: 0 1px 0 var(--edge-2); }
+button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px solid rgba(224, 113, 75, .45); outline-offset: 1px; }
+button.primary {
+  background: var(--accent); border-color: var(--accent-ink); color: #fff8f2;
+  box-shadow: 0 3px 0 var(--accent-ink);
+}
+button.primary:hover { background: #e8825d; box-shadow: 0 5px 0 var(--accent-ink); }
+select {
+  background: var(--panel); border: 2px solid var(--edge-2); border-radius: var(--r-sm);
+  padding: 5px 9px; min-height: 34px; font-weight: 600;
+}
+select:hover { border-color: #d3b287; }
+a { color: var(--accent-ink); font-weight: 600; }
+.panel {
+  background: var(--panel); border: 2px solid var(--edge); border-radius: var(--r);
+  box-shadow: var(--shadow);
+}
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+
+/* the metric hover */
+#metric-tip {
+  position: fixed; z-index: 80; pointer-events: none; max-width: 430px;
+  padding: 11px 14px; border-radius: 14px; font-size: 12.5px; line-height: 1.5;
+  background: rgba(255, 253, 248, .98); border: 2px solid var(--edge-2); border-left: 5px solid var(--accent);
+  box-shadow: 0 12px 30px rgba(122, 88, 58, .26);
+}
+#metric-tip .t { font-weight: 800; font-size: 13.5px; color: var(--text); }
+#metric-tip .f { margin: 5px 0; }
+#metric-tip .f code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--accent-ink); }
+#metric-tip .n { color: var(--muted); }
+[data-metric] { cursor: help; text-decoration: underline dotted rgba(138, 116, 97, .55); text-underline-offset: 3px; }
+
+/* ---- the tooltip ----------------------------------------------------------
+   One element, moved to the pointer. Positioned from JavaScript rather than
+   with `title`, because a native tooltip cannot show a table and takes a
+   second to appear - and the whole point is to answer a glance. */
+#tip {
+  position: fixed; z-index: 60; pointer-events: none;
+  max-width: 420px; padding: 10px 13px;
+  background: rgba(255, 253, 248, .98); border: 2px solid var(--edge-2); border-left-width: 5px;
+  border-radius: 14px; box-shadow: 0 12px 30px rgba(122, 88, 58, .26);
+  font-size: 12.5px; line-height: 1.45;
+}
+#tip .t { font-weight: 800; font-size: 13.5px; margin-bottom: 4px; }
+#tip table { border-collapse: collapse; }
+#tip td { padding: 1px 0; vertical-align: top; }
+#tip td.k { color: var(--muted); padding-right: 10px; white-space: nowrap; }
+#tip td.v { color: var(--text); }
+#tip .f { margin-top: 6px; padding-top: 6px; border-top: 2px dashed var(--edge); color: var(--muted); }
+#tip code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--accent-ink); }
+
+/* ---- page grid: scoreboard / kitchen + side / gantt + side / controls ---- */
+.app {
+  display: grid; gap: 12px; padding: 12px;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  grid-template-rows: auto minmax(var(--kitchen-min, 344px), var(--kitchen-max, 500px)) 1fr auto;
+  /* Deliberately a minimum and not a fixed height: on a window too short for
+     the two canvases' own minimums the grid has to be free to grow past it, or
+     the control bar in the last row ends up somewhere the page cannot scroll
+     to. Whenever the window is tall enough, the rows share it exactly and the
+     bar sits on screen - see the note on `#side`, which is what used to break
+     that. */
+  min-height: 100vh;
+}
+#scoreboard { grid-column: 1 / -1; grid-row: 1; }
+#kitchen-wrap { grid-column: 1; grid-row: 2; position: relative; overflow: hidden; min-height: 500px; }
+#gantt-wrap { grid-column: 1; grid-row: 3; position: relative; overflow: hidden; }
+/* The timeline scrolls sideways. The canvas is never wider than the scrollport
+   and is pinned to its left edge with `sticky`; the empty track behind it is
+   what supplies the scroll width. A canvas as wide as a long run would sail
+   past the browser's maximum canvas size, so we redraw the visible window on
+   every scroll and let the scrollbar be a real one. It is `scroll` rather than
+   `auto` because the timeline is a window onto a run longer than itself, so the
+   scrollbar is all but always there anyway - and having it there whether or not
+   it is needed makes what this row costs a constant, which is what
+   `layoutHeights` measures to work out how much room the kitchen may have. */
+#gantt-scroll { width: 100%; height: 100%; overflow-x: scroll; overflow-y: hidden; }
+#gantt-track { height: 100%; }
+#gantt { position: sticky; left: 0; width: auto; height: auto; }
+#gantt-scroll::-webkit-scrollbar { height: 13px; }
+#gantt-scroll::-webkit-scrollbar-track { background: var(--panel-2); border-radius: 7px; }
+#gantt-scroll::-webkit-scrollbar-thumb { background: #dcbd93; border-radius: 7px; border: 3px solid var(--panel); }
+#gantt-scroll::-webkit-scrollbar-thumb:hover { background: #cba572; }
+/* The side column spans both canvas rows, and must have no say in how tall
+   they are. With its panels in flow it did: a grid track is at least as tall as
+   its content, so the event log filling up as a run played grew the two rows
+   and walked the control bar off the bottom of the window. Taking the panels
+   out of flow - absolutely positioned inside a grid item that stretches to the
+   rows - makes that impossible. They scroll inside whatever room the canvases
+   leave them. */
+#side { grid-column: 2; grid-row: 2 / span 2; position: relative; min-width: 0; }
+#side-scroll {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  gap: 12px; overflow-y: auto; overscroll-behavior: contain;
+}
+#side-scroll::-webkit-scrollbar { width: 11px; }
+#side-scroll::-webkit-scrollbar-track { background: transparent; }
+#side-scroll::-webkit-scrollbar-thumb { background: #e0c8a4; border-radius: 7px; border: 3px solid var(--bg); }
+#side-scroll::-webkit-scrollbar-thumb:hover { background: #cba572; }
+/* The transport bar is pinned to the window, above everything but the score.
+ *
+ * Fixed rather than sticky or in-flow: restart, pause and the scrubber are the
+ * controls you reach for *while* you watch, so scroll position must never be
+ * able to put them out of reach - not on a short window, not in the stacked
+ * layout below, not at any scroll offset.
+ *
+ * Out of flow it no longer occupies its grid row, so the page reserves the
+ * room itself with a bottom padding measured from the bar - see the
+ * `--controls-h` line in `layoutHeights`. Without that the timeline's last
+ * rows would sit underneath it at the end of the scroll.
+ *
+ * z-index 19 puts it over the page and under `#overlay` (20), the end-of-run
+ * score panel: that one is meant to cover it, and nothing else is. */
+#controls {
+  position: fixed; left: 12px; right: 12px; bottom: 12px; z-index: 19;
+}
+/* Room for the fixed bar, from its measured height. The fallback covers the
+   first paint, before `layoutHeights` has run. */
+.app { padding-bottom: calc(var(--controls-h, 62px) + 24px); }
+@media (max-width: 1000px) {
+  .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto auto auto auto; }
+  #scoreboard, #kitchen-wrap, #gantt-wrap, #side, #controls { grid-column: 1; }
+  /* Stacked, the whole page scrolls as one: the panels go back into flow and
+     the column is as tall as they are. */
+  #side { position: static; }
+  #side-scroll { position: static; overflow-y: visible; }
+  #kitchen-wrap { grid-row: 2; } #gantt-wrap { grid-row: 3; } #side { grid-row: 4; } #controls { grid-row: 5; }
+}
+canvas { display: block; width: 100%; height: 100%; }
+
+/* ---- scoreboard ---- */
+#scoreboard { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 22px; padding: 12px 18px; position: relative; }
+#scoreboard .title { display: flex; flex-direction: column; min-width: 180px; }
+#scoreboard .title b { font-family: var(--font-display); font-size: 20px; font-weight: 700; }
+#scoreboard .stat { display: flex; flex-direction: column; min-width: 68px; }
+#scoreboard .stat .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; font-weight: 700; }
+#scoreboard .stat .v { font-family: var(--font-display); font-size: 23px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+#scoreboard .stat .v.bad { color: var(--bad); }
+#scoreboard .stat .v.good { color: var(--good); }
+#notice {
+  margin-left: auto; padding: 7px 14px; border-radius: 999px; font-weight: 700;
+  background: var(--panel-2); border: 2px solid var(--edge-2); opacity: 0; transition: opacity .25s;
+  max-width: 320px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#notice.show { opacity: 1; }
+#notice.bad { color: var(--bad); border-color: #f0c4bf; background: #fdeeec; }
+#notice.good { color: var(--good); border-color: #a8d8bd; background: #e9f7ef; }
+#notice.warn { color: var(--warn); border-color: #e8cf95; background: #fdf3d9; }
+
+/* ---- side panel ---- */
+#side .box { padding: 12px 14px; }
+#side h3 {
+  margin: 0 0 8px; font-family: var(--font-display); font-size: 13px; letter-spacing: .02em;
+  color: var(--accent-ink); font-weight: 700; padding-bottom: 7px; border-bottom: 2px dashed var(--edge);
+}
+#dbg-text { min-height: 36px; white-space: pre-wrap; word-break: break-word; font-size: 13px; }
+#dbg-extra { font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: var(--muted); white-space: pre-wrap; word-break: break-all; max-height: 80px; overflow: auto; }
+#log { list-style: none; margin: 0; padding: 0; font-size: 12px; font-variant-numeric: tabular-nums; }
+#log li { padding: 3px 0; border-bottom: 1px solid var(--edge); display: flex; gap: 8px; }
+#log li:last-child { border-bottom: 0; }
+#log li .t { color: var(--muted); min-width: 64px; }
+#log li.served { color: var(--good); } #log li.abandoned { color: var(--bad); }
+#log li.forfeit, #log li.rejected { color: var(--warn); }
+#inspector table { width: 100%; border-collapse: collapse; font-size: 12px; }
+#inspector td { padding: 2px 4px; vertical-align: top; }
+#inspector td:first-child { color: var(--muted); white-space: nowrap; }
+#inspector .steps { margin-top: 6px; }
+#inspector .step { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 2px 0; }
+#inspector .step .bar { flex: 1; height: 9px; background: var(--panel-2); border-radius: 5px; overflow: hidden; border: 1px solid var(--edge-2); }
+#inspector .step .bar i { display: block; height: 100%; }
+#inspector .step.wait .bar { background: repeating-linear-gradient(135deg, var(--panel-2) 0 3px, var(--edge-2) 3px 6px); }
+#inspector .step.current { font-weight: 700; }
+.swatch { display: inline-block; width: 11px; height: 11px; border-radius: 4px; vertical-align: middle; margin-right: 4px; }
+#results .total { font-family: var(--font-display); font-size: 30px; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--accent-ink); }
+.bars { display: grid; grid-template-columns: 84px 1fr 44px; gap: 5px 8px; align-items: center; font-size: 12px; }
+.bars .bar { height: 11px; background: var(--panel-2); border: 1px solid var(--edge-2); border-radius: 6px; overflow: hidden; }
+.bars .bar i { display: block; height: 100%; background: var(--accent); }
+.bars .n { text-align: right; font-variant-numeric: tabular-nums; }
+.kv { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; font-size: 12px; margin-top: 8px; }
+.kv .n { font-variant-numeric: tabular-nums; text-align: right; }
+.fail { color: var(--warn); font-size: 12px; margin-top: 6px; word-break: break-word; }
+
+/* ---- controls ---- */
+#controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding: 11px 15px; }
+#controls label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); font-weight: 600; }
+#scrub { flex: 1 1 240px; min-width: 160px; accent-color: var(--accent); }
+#pos { font-variant-numeric: tabular-nums; min-width: 150px; text-align: right; }
+kbd { font: 11px ui-monospace, Consolas, monospace; background: var(--panel-2); border: 1px solid var(--edge-2); border-bottom-width: 2px; border-radius: 5px; padding: 1px 5px; color: var(--muted); }
+
+/* ---- message / overlay ---- */
+#message { grid-column: 1 / -1; grid-row: 2; padding: 26px 28px; max-width: 720px; margin: 20px auto; width: 100%; }
+#message h2 { margin-top: 0; font-family: var(--font-display); font-weight: 700; }
+#message ul { padding-left: 18px; }
+#overlay {
+  position: fixed; inset: 0; background: rgba(74, 55, 40, .46); display: flex;
+  align-items: center; justify-content: center; z-index: 20; padding: 20px;
+}
+#overlay .card {
+  width: min(820px, 100%); max-height: 92vh; overflow-y: auto;
+  padding: 28px 32px; font-size: 16px; line-height: 1.5;
+}
+#overlay .big { font-family: var(--font-display); font-size: 66px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; color: var(--accent-ink); }
+#overlay .sub { color: var(--muted); font-size: 17px; margin-bottom: 18px; }
+#overlay .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 11px; margin: 18px 0; }
+#overlay .grid div { background: var(--panel-2); border: 2px solid var(--edge); border-radius: 14px; padding: 11px 14px; }
+#overlay .grid .k { font-size: 15px; color: var(--muted); letter-spacing: .01em; font-weight: 600; }
+#overlay .grid .v { font-family: var(--font-display); font-size: 25px; font-weight: 700; font-variant-numeric: tabular-nums; }
+#overlay .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
+#overlay .actions button { font-size: 16px; padding: 9px 22px; }
+
+/* ---- the worked score -------------------------------------------------------
+   Every component with the arithmetic that produced it, from this run's own
+   numbers. The formulas are the ones in sim-core/src/result.rs. */
+.work { margin: 4px 0 6px; }
+.work h4 {
+  margin: 0 0 12px; font-family: var(--font-display); font-size: 17px; font-weight: 700;
+  letter-spacing: .02em; color: var(--accent-ink);
+}
+.work .row { padding: 11px 0; border-top: 2px dashed var(--edge); }
+.work .row:first-of-type { border-top: 0; }
+.work .head { display: flex; align-items: baseline; gap: 10px; font-size: 17px; }
+.work .head b { font-weight: 800; }
+.work .head .wt { color: var(--muted); font-size: 16px; }
+.work .head .pts { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 800; }
+.work .bar { height: 11px; background: var(--panel-2); border: 1px solid var(--edge-2); border-radius: 6px; overflow: hidden; margin: 7px 0 8px; }
+.work .bar i { display: block; height: 100%; background: var(--accent); }
+.work .calc { font-size: 16px; color: var(--muted); }
+.work .calc code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 16px;
+  color: var(--accent-ink); white-space: nowrap;
+}
+.work .calc .line { padding: 1px 0; overflow-x: auto; }
+.work .sum {
+  margin-top: 14px; padding-top: 12px; border-top: 3px solid var(--edge-2);
+  font-size: 16px; overflow-x: auto;
+}
+.work .sum code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--accent-ink); white-space: nowrap; }
+</style>
+</head>
+<body>
+<div id="tip" role="tooltip" hidden></div>
+<div class="app" id="app">
+  <header id="scoreboard" class="panel">
+    <div class="title">
+      <b id="sb-policy">Short Order</b>
+      <span class="small muted"><span id="sb-profile">loading…</span> · seed <span id="sb-seed">–</span></span>
+    </div>
+    <div class="stat"><span class="k">tick</span><span class="v" id="sb-tick">0</span></div>
+    <div class="stat"><span class="k">clock</span><span class="v" id="sb-clock">00:00</span></div>
+    <div class="stat"><span class="k">served</span><span class="v good" id="sb-served">0</span></div>
+    <div class="stat"><span class="k">walked out</span><span class="v bad" id="sb-abandoned">0</span></div>
+    <div class="stat"><span class="k">live orders</span><span class="v" id="sb-live">0</span></div>
+    <div class="stat"><span class="k">switches</span><span class="v" id="sb-switches">0</span></div>
+    <div class="stat"><span class="k">utilisation</span><span class="v" id="sb-util">0%</span></div>
+    <div id="notice" role="status" aria-live="polite"></div>
+  </header>
+
+  <section id="message" class="panel" hidden></section>
+
+  <section id="kitchen-wrap" class="panel" aria-label="Kitchen">
+    <canvas id="kitchen" role="img" aria-label="Animated kitchen: ticket rail, the stations and how many places at each are taken, the grill and oven, the serving hatch and the door"></canvas>
+  </section>
+
+  <section id="gantt-wrap" class="panel" aria-label="Timeline">
+    <div id="gantt-scroll">
+      <div id="gantt-track">
+        <canvas id="gantt" role="img" aria-label="Gantt timeline of what each cook worked on; click or drag to scrub, wheel to pan"></canvas>
+      </div>
+    </div>
+  </section>
+
+  <aside id="side"><div id="side-scroll">
+    <div class="box panel" id="debug-box">
+      <h3>Scheduler says</h3>
+      <div id="dbg-text" class="muted">–</div>
+      <div id="dbg-extra"></div>
+    </div>
+    <div class="box panel">
+      <h3>Event log</h3>
+      <ul id="log"></ul>
+    </div>
+    <div class="box panel" id="inspector">
+      <h3>Order inspector</h3>
+      <div id="inspector-body" class="muted small">Click a ticket, a cook or an oven dish to inspect the order. Click empty floor to clear.</div>
+    </div>
+    <div class="box panel" id="results">
+      <h3>Result</h3>
+      <div id="results-body" class="muted small">–</div>
+    </div>
+  </div></aside>
+
+  <footer id="controls" class="panel">
+    <button id="btn-restart" title="Restart (Home)">⟲ restart</button>
+    <button id="btn-back" title="Step back one frame (←)">‹ step</button>
+    <button id="btn-play" class="primary" title="Play / pause (space)">▶ play</button>
+    <button id="btn-fwd" title="Step forward one frame (→)">step ›</button>
+    <label>speed <select id="speed" title="Playback speed; 1× plays one tick every tick_ms"></select></label>
+    <input id="scrub" type="range" min="0" max="0" step="1" value="0" aria-label="Scrub through the run">
+    <span id="pos" class="muted">tick 0 / 0</span>
+    <label>zoom <select id="zoom" title="How many ticks the timeline shows at once"><option value="100">100 ticks</option><option value="250" selected>250 ticks</option><option value="500">500 ticks</option><option value="1000">1000 ticks</option><option value="2000">2000 ticks</option><option value="fit">whole run</option></select></label>
+    <label><input type="checkbox" id="follow" checked> follow</label>
+    <button id="btn-results" class="primary" title="The score, and the arithmetic behind it">▦ score breakdown</button>
+    <span class="small muted"><kbd>space</kbd> play · <kbd>←</kbd><kbd>→</kbd> step · <kbd>Home</kbd> restart</span>
+  </footer>
+</div>
+
+<div id="overlay" hidden>
+  <div class="card panel" role="dialog" aria-modal="true" aria-labelledby="ov-title">
+    <div id="ov-body"></div>
+    <div class="actions"><button id="ov-close" class="primary">close</button></div>
+  </div>
+</div>
+
+<script>
+'use strict';
+/* =========================================================================
+ * PART 1 · PURE FUNCTIONS (no DOM access at definition or call time)
+ * ========================================================================= */
+
+// Colour-blind-friendly categorical palette: Okabe-Ito hues, then Tol
+// bright/vibrant, each darkened just enough to read on the cream kitchen floor
+// (the pale yellow and the light grey were invisible on it). One hue per recipe
+// name; a menu with more recipes than colours wraps around.
+const PALETTE = [
+  '#d68000', '#3d8fce', '#00876c', '#b79a1f', '#c1668f', '#cc5500', '#0f6ba8',
+  '#d1504f', '#3aa3bd', '#a08c2a', '#8f3a72', '#3d6ea8', '#8c8378', '#2c7a3f',
+];
+// Jacket colours for the cooks (one per core), kept distinct from each other
+// and dark enough to sit on the cream floor without washing out.
+const COOK_COLOURS = [
+  '#3f7fd8', '#d9604a', '#3f9070', '#c98f1e', '#8e63c9', '#e07a2f', '#2f93a8',
+  '#b4589e', '#5a9a4f', '#d9608a', '#5b78d9', '#9a8a1e', '#2f9c8b', '#b0522f',
+  '#6a6ad0', '#7d9a2a',
+];
+const SPEEDS = [0.5, 1, 2, 4, 8, 16];
+const MAX_LOG = 12;
+const MAX_TICKETS = 28;
+const TICKET_W = 116, TICKET_H = 96, TICKET_GAP = 8;
+const STATION_PAD = 14, PLACE_W = 116;
+/** How much bigger a cook is drawn than the primitives that make it up. */
+const COOK_SCALE = 1.9;
+
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+/** FNV-1a string hash, for stable colour choice of recipes not in the menu. */
+function hashString(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2;
+  if (max === min) return [0, 0, l];
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h;
+  if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+  else if (max === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  return [h * 60, s, l];
+}
+/** A CSS colour: `hex` with its lightness nudged by `dl` percentage points. */
+function shadeHex(hex, dl) {
+  const [h, s, l] = rgbToHsl(...hexToRgb(hex));
+  return `hsl(${h.toFixed(0)} ${(s * 100).toFixed(0)}% ${clamp(l * 100 + dl, 8, 92).toFixed(0)}%)`;
+}
+/** Black or white text, whichever reads better on `hex`. */
+function textOn(hex) {
+  const [r, g, b] = hexToRgb(hex);
+  return (0.299 * r + 0.587 * g + 0.114 * b) > 150 ? '#3d2f26' : '#fffdf8';
+}
+
+function fmtClock(tick, tickMs) {
+  const total = Math.floor((tick * tickMs) / 1000);
+  const m = Math.floor(total / 60), s = total % 60;
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+function pct(x) { return Number.isFinite(x) ? `${(x * 100).toFixed(x >= 0.995 ? 0 : 1)}%` : '–'; }
+function num(x, d) { return Number.isFinite(x) ? x.toFixed(d == null ? 1 : d) : '–'; }
+function stars(priority) { return '★'.repeat(clamp(priority | 0, 1, 3)); }
+
+/** Number of elements of the ascending array `arr` that are `<= v`. */
+function upperBound(arr, v) {
+  let lo = 0, hi = arr.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid] <= v) lo = mid + 1; else hi = mid; }
+  return lo;
+}
+
+/**
+ * Builds a Gantt row per core from the frames: consecutive ticks during which a
+ * core held the same order in the same state are merged into one segment
+ * `{from, to, s, o}` covering ticks `[from, to)`. With frame_interval > 1 a
+ * segment simply spans the gap to the next recorded frame (hold semantics).
+ * Every tick from frames[0].t to frames[last].t inclusive is covered.
+ */
+function precomputeGantt(frames, cores) {
+  const rows = [];
+  for (let c = 0; c < cores; c++) rows.push([]);
+  for (let i = 0; i < frames.length; i++) {
+    const f = frames[i];
+    const to = i + 1 < frames.length ? frames[i + 1].t : f.t + 1;
+    for (let c = 0; c < cores; c++) {
+      const cf = f.cores[c] || { s: 'idle', o: null, r: 0 };
+      const o = cf.o == null ? null : cf.o;
+      const row = rows[c];
+      const last = row[row.length - 1];
+      if (last && last.s === cf.s && last.o === o && last.to === f.t) last.to = to;
+      else row.push({ from: f.t, to, s: cf.s, o });
+    }
+  }
+  return rows;
+}
+
+/**
+ * Indexes a replay document once. Everything the viewer needs per tick is then
+ * an O(1) array access or an O(log n) binary search.
+ */
+function buildIndex(doc) {
+  const header = doc.header || {};
+  const config = header.config || {};
+  const kitchen = config.kitchen || {};
+  const recipes = Array.isArray(config.recipe) ? config.recipe : [];
+  const declared = Array.isArray(config.station) ? config.station : [];
+  const frames = Array.isArray(doc.frames) ? doc.frames : [];
+  const events = Array.isArray(doc.events) ? doc.events.slice() : [];
+  const debug = Array.isArray(doc.debug) ? doc.debug.slice() : [];
+  const specs = Array.isArray(header.orders) ? header.orders : [];
+  events.sort((a, b) => a.tick - b.tick);   // stable: same-tick order preserved
+  debug.sort((a, b) => a.tick - b.tick);
+
+  // The header's `cores` can differ from the run's if the CLI overrode it;
+  // the frames are authoritative.
+  const cores = frames.length && frames[0].cores ? frames[0].cores.length : (kitchen.cores || 1);
+  const switchCost = kitchen.switch_cost == null ? 0 : kitchen.switch_cost;
+  const tickMs = kitchen.tick_ms || 100;
+  const frameInterval = header.frame_interval || 1;
+  const lastTick = frames.length ? frames[frames.length - 1].t : 0;
+  const maxTicks = Math.max(kitchen.max_ticks || 0, lastTick);
+
+  // Stations. A profile that declares them is the authority on where a step
+  // happens and how many cooks fit there.
+  //
+  // Whether *this* run had them is decided from its own steps, not from the
+  // station list: the engine's reader fills a missing list with today's
+  // default, so a replay recorded before stations existed comes back carrying
+  // three it never had. Its steps name none, and that is the tell. Such a run
+  // gets the label heuristic and counters with room for everybody, which is
+  // exactly how that kitchen ran.
+  const contended = declared.length > 0
+    && specs.some((o) => Array.isArray(o.steps) && o.steps.some((s) => s.station != null));
+  const stations = contended
+    ? declared.map((s, i) => ({
+        index: i, name: s.name, label: s.label || s.name, capacity: Math.max(1, s.capacity || 1),
+      }))
+    : ['board', 'hob', 'pass', 'bar'].map((name, i) => ({
+        index: i, name, label: STATION_NAMES[name] || name, capacity: cores,
+      }));
+  const stationByName = new Map(stations.map((s) => [s.name, s]));
+
+  // Recipe colours: by position in the menu, hashed for anything off-menu.
+  const recipeColour = new Map();
+  recipes.forEach((r, i) => recipeColour.set(r.name, PALETTE[i % PALETTE.length]));
+  const colourOf = (name) => {
+    if (!recipeColour.has(name)) recipeColour.set(name, PALETTE[hashString(String(name)) % PALETTE.length]);
+    return recipeColour.get(name);
+  };
+
+  // Per-order metadata plus the lifecycle facts the frames alone do not carry.
+  const orders = specs.map((spec) => {
+    const base = colourOf(spec.recipe);
+    const steps = Array.isArray(spec.steps) ? spec.steps : [];
+    return {
+      id: spec.id, recipe: spec.recipe, priority: spec.priority || 1,
+      arrival: spec.arrival || 0, deadline: spec.deadline || 0,
+      patience: spec.patience || Math.max(1, (spec.deadline || 0) - (spec.arrival || 0)),
+      steps,
+      totalWork: steps.filter((s) => s.kind === 'work').reduce((a, s) => a + s.duration, 0),
+      base, colour: shadeHex(base, ((spec.id * 7) % 5 - 2) * 3), text: textOn(base),
+      dispatches: [], preemptions: [], servedAt: null, abandonedAt: null,
+      firstWorkAt: null, readyTicks: [],
+    };
+  });
+  const byId = new Map(orders.map((o) => [o.id, o]));
+
+  // Events per tick, and the per-order lifecycle.
+  const eventsByTick = new Map();
+  const dispatchTicks = [];
+  for (const e of events) {
+    let list = eventsByTick.get(e.tick);
+    if (!list) { list = []; eventsByTick.set(e.tick, list); }
+    list.push(e);
+    const o = e.order == null ? null : byId.get(e.order);
+    switch (e.kind) {
+      case 'dispatched': dispatchTicks.push(e.tick); if (o) o.dispatches.push(e.tick); break;
+      case 'preempted': if (o) o.preemptions.push(e.tick); break;
+      case 'served': if (o) o.servedAt = e.tick; break;
+      case 'abandoned': if (o) o.abandonedAt = e.tick; break;
+      default: break;
+    }
+  }
+
+  // One pass over the frames: Gantt rows, ready ticks per order (for "waited"),
+  // first working tick per order (response), and a prefix sum of working
+  // core-ticks (for live utilisation).
+  const frameTicks = frames.map((f) => f.t);
+  const gantt = precomputeGantt(frames, cores);
+  const workPrefix = new Float64Array(frames.length + 1);
+  for (let i = 0; i < frames.length; i++) {
+    const f = frames[i];
+    const span = i + 1 < frames.length ? frames[i + 1].t - f.t : 1;
+    let working = 0;
+    for (const c of f.cores) if (c.s === 'working') working++;
+    workPrefix[i + 1] = workPrefix[i] + working * span;
+    for (const of of f.orders) {
+      const o = byId.get(of.id);
+      if (o && of.st === 'ready') o.readyTicks.push(f.t);
+    }
+  }
+  for (const row of gantt) {
+    for (const seg of row) {
+      if (seg.s !== 'working' || seg.o == null) continue;
+      const o = byId.get(seg.o);
+      if (o && (o.firstWorkAt == null || seg.from < o.firstWorkAt)) o.firstWorkAt = seg.from;
+    }
+  }
+
+  return {
+    doc, header, config, kitchen, recipes, stations, stationByName, contended,
+    cores, switchCost, tickMs, frameInterval,
+    frames, frameTicks, lastTick, maxTicks, orders, byId, events, eventsByTick,
+    dispatchTicks, debug, debugTicks: debug.map((d) => d.tick), gantt, workPrefix,
+    recipeColour, result: doc.result || null, frameCache: new Array(frames.length),
+  };
+}
+
+/** Index of the latest frame recorded at or before `tick` (0 if none is). */
+function frameIndexAt(index, tick) {
+  const n = upperBound(index.frameTicks, tick);
+  return n > 0 ? n - 1 : 0;
+}
+
+/**
+ * The recorded state at frame `i`: the frame itself plus lookups (live orders
+ * by id, ids grouped by state). Memoised per frame, so repeated calls are O(1).
+ */
+function stateAt(index, i) {
+  if (!index.frames.length) {
+    return { i: 0, t: 0, frame: null, live: new Map(), ready: [], running: [], blocked: [], served: 0, abandoned: 0, liveCount: 0 };
+  }
+  i = clamp(i | 0, 0, index.frames.length - 1);
+  let s = index.frameCache[i];
+  if (s) return s;
+  const f = index.frames[i];
+  const live = new Map(), ready = [], running = [], blocked = [];
+  for (const of of f.orders) {
+    live.set(of.id, of);
+    if (of.st === 'ready') ready.push(of.id);
+    else if (of.st === 'running') running.push(of.id);
+    else if (of.st === 'blocked') blocked.push(of.id);
+  }
+  s = { i, t: f.t, frame: f, live, ready, running, blocked, served: f.served, abandoned: f.abandoned, liveCount: f.orders.length };
+  index.frameCache[i] = s;
+  return s;
+}
+
+/**
+ * The kitchen at fractional tick `time`, for smooth drawing between frames.
+ * States are held from the frame at/before `time`; the quantities that the
+ * engine decrements once per tick (switch ticks remaining, step ticks
+ * remaining) are advanced continuously so rings and walks do not jump. This
+ * also covers frame_interval > 1: the same rule spans the gap between frames.
+ */
+function interp(index, time) {
+  const frames = index.frames;
+  if (!frames.length) return null;
+  const i = frameIndexAt(index, Math.floor(time));
+  const a = frames[i], b = frames[i + 1] || null;
+  const span = b ? Math.max(1, b.t - a.t) : 1;
+  const alpha = b ? clamp((time - a.t) / span, 0, 1) : 0;
+  const elapsed = alpha * span;   // ticks elapsed since frame `a`
+
+  const cores = a.cores.map((c) => {
+    const out = { s: c.s, o: c.o == null ? null : c.o, r: c.r, progress: 0 };
+    if (c.s === 'switching') {
+      out.r = Math.max(0, c.r - elapsed);
+      out.progress = index.switchCost > 0 ? clamp(1 - out.r / index.switchCost, 0, 1) : 1;
+    }
+    return out;
+  });
+
+  const orders = new Map();
+  for (const of of a.orders) {
+    const spec = index.byId.get(of.id);
+    const step = spec ? spec.steps[of.step] : null;
+    const duration = step ? Math.max(1, step.duration) : Math.max(1, of.rem);
+    const core = of.core == null ? null : a.cores[of.core];
+    // A blocked order's timer runs; a running order only progresses once the
+    // cook has finished the context switch and is actually working.
+    const advancing = of.st === 'blocked' || (of.st === 'running' && core && core.s === 'working');
+    const rem = advancing ? Math.max(0, of.rem - elapsed) : of.rem;
+    orders.set(of.id, {
+      id: of.id, st: of.st, step: of.step, rem, duration,
+      core: of.core == null ? null : of.core,
+      progress: clamp(1 - rem / duration, 0, 1),
+      label: step ? step.label : '', kind: step ? step.kind : 'work',
+    });
+  }
+  return { time, frameIndex: i, frame: a, alpha, cores, orders, served: a.served, abandoned: a.abandoned, state: stateAt(index, i) };
+}
+
+/** The scheduler's most recent debug entry at or before `tick`, or null. */
+function debugAt(index, tick) {
+  const n = upperBound(index.debugTicks, tick);
+  return n > 0 ? index.debug[n - 1] : null;
+}
+
+/**
+ * Normalises a debug payload (any JSON the scheduler attached) into
+ * `{text, queue, tags, extra}`. The student SDK's `annotate()` writes `text`,
+ * `queue` (ids in the order the scheduler means to serve them) and `tags`
+ * ({id: label}); anything else is shown raw as `extra`.
+ */
+function normalisePayload(payload) {
+  const out = { text: '', queue: null, tags: new Map(), extra: null };
+  if (payload == null) return out;
+  if (typeof payload !== 'object' || Array.isArray(payload)) {
+    out.text = typeof payload === 'string' ? payload : JSON.stringify(payload);
+    return out;
+  }
+  if (payload.text != null) out.text = String(payload.text);
+  if (Array.isArray(payload.queue)) out.queue = payload.queue.map(Number).filter(Number.isFinite);
+  if (payload.tags && typeof payload.tags === 'object') {
+    if (Array.isArray(payload.tags)) {
+      for (const pair of payload.tags) if (Array.isArray(pair) && pair.length >= 2) out.tags.set(Number(pair[0]), String(pair[1]));
+    } else {
+      for (const k of Object.keys(payload.tags)) out.tags.set(Number(k), String(payload.tags[k]));
+    }
+  }
+  const extra = {};
+  let any = false;
+  for (const k of Object.keys(payload)) {
+    if (k === 'text' || k === 'queue' || k === 'tags') continue;
+    extra[k] = payload[k]; any = true;
+  }
+  if (any) out.extra = extra;
+  return out;
+}
+
+/**
+ * The order tickets hang on the rail: the scheduler's `queue` order for the
+ * ready orders it listed, then any other ready order in arrival (id) order.
+ * Ids in the queue that are not ready (running, blocked, gone) are ignored.
+ */
+function railOrder(readyIds, queue) {
+  const byArrival = readyIds.slice().sort((a, b) => a - b);
+  if (!Array.isArray(queue) || !queue.length) return byArrival;
+  const pos = new Map();
+  queue.forEach((id, i) => { if (!pos.has(id)) pos.set(id, i); });
+  const listed = byArrival.filter((id) => pos.has(id)).sort((a, b) => pos.get(a) - pos.get(b));
+  const rest = byArrival.filter((id) => !pos.has(id));
+  return listed.concat(rest);
+}
+
+function describeOrder(index, id) {
+  const o = index.byId.get(id);
+  return o ? `${o.recipe} #${o.id}` : `order #${id}`;
+}
+
+/** Label of the step an order is on in the frame at/before `tick`. */
+function stepLabelAt(index, id, tick) {
+  const o = index.byId.get(id);
+  if (!o) return '';
+  const of = stateAt(index, frameIndexAt(index, tick)).live.get(id);
+  const step = of ? o.steps[of.step] : null;
+  return step ? step.label : '';
+}
+
+/** Human wording for an event, without the tick prefix. */
+function eventText(index, e) {
+  const who = e.order != null ? describeOrder(index, e.order) : '';
+  const cook = e.core != null ? `cook ${e.core}` : 'a cook';
+  const msg = e.message ? String(e.message) : '';
+  switch (e.kind) {
+    case 'start': return 'service opens';
+    case 'arrived': {
+      const o = index.byId.get(e.order);
+      return `${who} arrived${o && o.priority > 1 ? ` (${stars(o.priority)})` : ''}`;
+    }
+    case 'dispatched': return `${cook} took ${who}`;
+    case 'preempted': return `${who} taken off ${cook}`;
+    case 'blocked': {
+      const label = stepLabelAt(index, e.order, e.tick);
+      return `${who} into the oven${label ? ` (${label})` : ''}`;
+    }
+    case 'unblocked': return `${who} out of the oven, back on the rail`;
+    case 'served': return `${who} served`;
+    case 'abandoned': return `${who} walked out`;
+    case 'timer': return 'scheduler’s alarm rang';
+    case 'rejected': return `decision rejected${msg ? `: ${msg}` : ''}`;
+    case 'forfeit': return `run forfeited${msg ? `: ${msg}` : ''}`;
+    case 'finished': return `service closed${msg ? ` (${msg})` : ''}`;
+    default: return `${e.kind}${who ? ` ${who}` : ''}${msg ? ` · ${msg}` : ''}`;
+  }
+}
+
+/** Context switches (dispatches) that have happened by `tick`. */
+function switchesSoFar(index, tick) { return upperBound(index.dispatchTicks, tick); }
+
+/** Share of core-ticks spent working, from tick 0 up to frame `i`. */
+function utilisationSoFar(index, i) {
+  const f = index.frames[i];
+  if (!f || f.t <= 0) return 0;
+  return index.workPrefix[i] / (index.cores * f.t);
+}
+
+/** Ticks an order has spent on the rail (ready) up to `tick`. */
+function waitedAt(index, order, tick) {
+  return upperBound(order.readyTicks, tick) * index.frameInterval;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+}
+
+/* Where in the kitchen a step happens.
+ *
+ * The engine has no notion of place - a step is a label, a kind and a duration -
+ * so the viewer derives one. That is why stations cost nothing: no rule, no
+ * metric and no submission changes. Labels are matched first, so a menu can say
+ * what it means; anything unrecognised falls back to the shape of the recipe,
+ * which reads the way a line actually works - prep first, appliance in the
+ * middle, plate last. */
+const STATION_PATTERNS = [
+  ['board', /chop|slice|dice|prep|shape|peel|wash|trim|mince|knead|roll|fold|laminate|whisk|beat|mix/i],
+  ['hob', /sear|fry|saute|saut\u00e9|stir|brown|reduce|flip|sizzle|wok|toss|deglaze/i],
+  ['pass', /plate|assemble|ladle|garnish|finish|dress|fill|glaze|carve|box|serve/i],
+  ['bar', /pull|pour|brew|shake|steam|froth|tap|blend/i],
+];
+const APPLIANCE_PATTERNS = [
+  ['grill', /grill|sear|fry|pan|sizzle|char|toast|griddle|brown/i],
+  ['oven', /oven|bake|roast|prove|rest|braise|simmer|steep|chill|marinate|infuse|set|cool/i],
+];
+
+/** 'board' | 'hob' | 'pass' | 'bar' for a work step; 'grill' | 'oven' for a wait. */
+function stationForStep(label, kind, stepIndex, stepCount) {
+  const text = String(label || '');
+  if (kind === 'wait') {
+    for (const [name, re] of APPLIANCE_PATTERNS) if (re.test(text)) return name;
+    return 'oven';
+  }
+  for (const [name, re] of STATION_PATTERNS) if (re.test(text)) return name;
+  if (stepIndex >= stepCount - 1) return 'pass';
+  if (stepIndex <= 0) return 'board';
+  return 'hob';
+}
+
+const STATION_NAMES = { board: 'prep bench', hob: 'stove', pass: 'the pass', bar: 'bar', grill: 'grill', oven: 'oven' };
+
+// Exported for headless tests (node) and for poking at from the console.
+const ShortOrder = {
+  PALETTE, COOK_COLOURS, SPEEDS, buildIndex, precomputeGantt, frameIndexAt, stateAt, interp,
+  debugAt, normalisePayload, railOrder, describeOrder, stepLabelAt, eventText,
+  switchesSoFar, utilisationSoFar, waitedAt, upperBound, shadeHex, textOn, fmtClock, escapeHtml,
+  stationForStep, STATION_NAMES,
+};
+if (typeof module !== 'undefined' && module.exports) module.exports = ShortOrder;
+
+/* =========================================================================
+ * PART 2 · THE VIEWER (DOM + canvas). Nothing below runs unless boot() does.
+ * ========================================================================= */
+
+/** All mutable viewer state, in one place. */
+const V = {
+  index: null,            // built by buildIndex()
+  time: 0,                // playback position in ticks (fractional while playing)
+  playing: false,
+  speed: 0.5,             // 1x = one tick per kitchen.tick_ms
+  follow: true,           // the timeline scrolls to keep the playhead in view
+  zoom: 250,              // timeline scale: 'fit', or how many ticks to show at once
+  selected: null,         // order id in the inspector
+  lastEventTick: -1,      // events up to and including this tick have been processed
+  log: [],                // recent events for the side panel (newest first)
+  logDirty: true,
+  fx: [],                 // transient animations: served / abandoned / unblocked slides
+  lastPos: new Map(),     // where each order card was last drawn: id -> {x, y, w, h}
+  hits: [],               // click targets rebuilt each frame: {x, y, w, h, id}
+  slots: { oven: new Map(), grill: new Map() },  // stable appliance slot per blocked order id
+  cookPos: new Map(),     // core -> {x, y}: where each cook is standing right now
+  errands: new Map(),     // core -> a trip to the larder or the oven
+  fetchedAt: new Map(),   // core -> when its last larder trip ended
+  lastDrawNow: 0,         // performance clock at the previous kitchen frame
+  lastDrawTime: 0,        // V.time at the previous kitchen frame, to spot a scrub
+  noticeUntil: 0,
+  endShownFor: -1,        // the tick at which the end overlay was last auto-shown
+  lastNow: 0,
+  lastTick: -1,           // last integer tick the DOM panels were refreshed for
+  tipKey: null,           // what the tooltip is currently showing, to avoid rebuilding it
+  drag: null,             // {wasPlaying} while scrubbing on the Gantt
+  kitchen: { canvas: null, ctx: null, w: 0, h: 0 },
+  gantt: { canvas: null, ctx: null, w: 0, h: 0 },
+};
+const el = {};   // DOM references, filled in boot()
+const $ = (id) => document.getElementById(id);
+
+// ---- loading --------------------------------------------------------------
+
+function showMessage(html) {
+  el.message.innerHTML = html;
+  el.message.hidden = false;
+  for (const id of ['kitchen-wrap', 'gantt-wrap', 'side', 'controls']) $(id).hidden = true;
+}
+function hideMessage() {
+  el.message.hidden = true;
+  for (const id of ['kitchen-wrap', 'gantt-wrap', 'side', 'controls']) $(id).hidden = false;
+}
+
+/** Reads ?src= / ?replay= / ?speed=, fetches the document and indexes it. */
+async function loadReplay() {
+  const params = new URLSearchParams(location.search);
+  const src = params.get('src');
+  const name = params.get('replay');
+  const speed = parseFloat(params.get('speed'));
+  if (Number.isFinite(speed) && speed > 0) V.speed = speed;
+
+  if (!src && !name) { await showReplayList(); return; }
+  const url = src || `api/replay?name=${encodeURIComponent(name)}`;
+  showMessage(`<h2>Loading replay…</h2><p class="muted">${escapeHtml(url)}</p>`);
+  let doc;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    doc = await res.json();
+  } catch (err) {
+    showMessage(`<h2>Could not load the replay</h2><p><code>${escapeHtml(url)}</code></p>`
+      + `<p class="muted">${escapeHtml(String(err))}</p><p><a href="viewer.html">Back to the list</a></p>`);
+    return;
+  }
+  if (!doc || typeof doc !== 'object' || !doc.header || !Array.isArray(doc.frames)) {
+    showMessage('<h2>That is not a replay document</h2><p class="muted">Expected an object with <code>header</code>, <code>frames</code> and <code>events</code>.</p>');
+    return;
+  }
+  if (!doc.frames.length) {
+    showMessage('<h2>Empty replay</h2><p class="muted">The document has no frames to show.</p>');
+    return;
+  }
+  V.index = buildIndex(doc);
+  hideMessage();
+  setupForIndex();
+}
+
+async function showReplayList() {
+  let items = '';
+  try {
+    const res = await fetch('api/replays');
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    const data = await res.json();
+    const names = Array.isArray(data.replays) ? data.replays : [];
+    items = names.length
+      ? `<ul>${names.map((n) => `<li><a href="viewer.html?replay=${encodeURIComponent(n)}">${escapeHtml(n)}</a></li>`).join('')}</ul>`
+      : '<p class="muted">No replays recorded yet. Run a scheduler with <code>--replay</code> and come back.</p>';
+  } catch (err) {
+    items = `<p class="muted">Could not list replays (${escapeHtml(String(err))}). Open one directly with <code>?replay=&lt;file.rep&gt;</code> or <code>?src=&lt;url&gt;</code>.</p>`;
+  }
+  showMessage(`<h2>No replay chosen</h2><p>Pick a recorded run to watch:</p>${items}`);
+}
+
+/** One-time setup after a document is indexed. */
+function setupForIndex() {
+  const idx = V.index;
+  const h = idx.header;
+  el.sbPolicy.textContent = `${h.policy || 'scheduler'}${h.policy_version ? ` v${h.policy_version}` : ''}`;
+  el.sbProfile.textContent = `${idx.kitchen.name || 'kitchen'} · ${idx.cores} cook${idx.cores === 1 ? '' : 's'} · switch cost ${idx.switchCost}`;
+  // A marking replay is served without its seed - the class site withholds
+  // the marking seeds - and carries its position in the run instead.
+  const where = h.seed != null ? `seed ${h.seed}`
+    : h.run_index != null ? `run ${h.run_index}` : null;
+  el.sbSeed.textContent = where ? where.replace(/^seed /, '') : '–';
+  document.title = `Short Order · ${h.policy || 'replay'}${where ? ' · ' + where : ''}`;
+
+  // Speed menu: the standard steps plus whatever ?speed= asked for.
+  const speeds = SPEEDS.includes(V.speed) ? SPEEDS : SPEEDS.concat([V.speed]).sort((a, b) => a - b);
+  el.speed.innerHTML = speeds.map((s) => `<option value="${s}"${s === V.speed ? ' selected' : ''}>${s}×</option>`).join('');
+  el.scrub.max = String(idx.lastTick);
+  el.resultsBody.innerHTML = resultsHtml(idx, false);
+  restart();
+  layoutHeights();
+  resizeCanvas(V.kitchen, el.kitchenWrap);
+  resizeGantt();
+  followPlayhead(true);
+  refreshPanels(0, true);
+  requestAnimationFrame(loop);
+}
+
+// ---- playback --------------------------------------------------------------
+
+function setTime(t) {
+  V.time = clamp(t, 0, V.index ? V.index.lastTick : 0);
+}
+function play() {
+  if (!V.index) return;
+  if (V.time >= V.index.lastTick) { restart(); }
+  V.playing = true;
+  el.btnPlay.textContent = '❚❚ pause';
+}
+function pause() {
+  V.playing = false;
+  el.btnPlay.textContent = '▶ play';
+}
+function togglePlay() { if (V.playing) pause(); else play(); }
+function restart() {
+  pause();
+  setTime(0);
+  resetTransients();
+  V.endShownFor = -1;
+}
+/** Jumps one recorded frame back or forward and pauses. */
+function stepFrame(dir) {
+  if (!V.index) return;
+  pause();
+  const frames = V.index.frames;
+  const i = frameIndexAt(V.index, Math.floor(V.time));
+  const j = clamp(i + dir, 0, frames.length - 1);
+  setTime(frames[j].t);
+}
+function resetTransients() {
+  V.fx.length = 0;
+  V.lastEventTick = -1;
+  V.log.length = 0;
+  V.logDirty = true;
+  V.slots.oven.clear();
+  V.slots.grill.clear();
+  V.cookPos.clear();
+  V.errands.clear();
+  V.fetchedAt.clear();
+}
+
+/**
+ * Brings the event log and transient animations up to `curTick`. Playing
+ * forward fires every event in between (with animations); jumping or scrubbing
+ * rebuilds the log from history without animations.
+ */
+function syncEvents(curTick) {
+  if (curTick === V.lastEventTick) return;
+  const idx = V.index;
+  const jumped = curTick < V.lastEventTick || curTick - V.lastEventTick > 40;
+  if (jumped) {
+    V.fx.length = 0;
+    V.log.length = 0;
+    // Walk back from curTick until the log is full or history runs out.
+    for (let t = curTick; t >= 0 && V.log.length < MAX_LOG; t--) {
+      const evs = idx.eventsByTick.get(t);
+      if (!evs) continue;
+      for (let k = evs.length - 1; k >= 0 && V.log.length < MAX_LOG; k--) V.log.push(evs[k]);
+    }
+    V.logDirty = true;
+    V.lastEventTick = curTick;
+    return;
+  }
+  for (let t = V.lastEventTick + 1; t <= curTick; t++) {
+    const evs = idx.eventsByTick.get(t);
+    if (!evs) continue;
+    for (const e of evs) {
+      V.log.unshift(e);
+      spawnFx(e);
+    }
+  }
+  if (V.log.length > MAX_LOG) V.log.length = MAX_LOG;
+  V.logDirty = true;
+  V.lastEventTick = curTick;
+}
+
+/** Starts the animation an event deserves and flashes the scoreboard notice. */
+function spawnFx(e) {
+  const idx = V.index;
+  const now = performance.now();
+  const from = e.order != null ? V.lastPos.get(e.order) : null;
+  switch (e.kind) {
+    case 'served':
+      V.fx.push({ kind: 'served', id: e.order, from, start: now, dur: 900 });
+      flash(`${describeOrder(idx, e.order)} served`, 'good');
+      break;
+    case 'abandoned':
+      V.fx.push({ kind: 'abandoned', id: e.order, from, start: now, dur: 1100 });
+      flash(`${describeOrder(idx, e.order)} walked out`, 'bad');
+      break;
+    case 'blocked': {
+      // The dish is going into the oven or onto the grill, and it does not
+      // walk there itself: the cook that finished the step carries it, then
+      // comes back. The engine freed that cook the moment the step ended, so
+      // this is the one thing on screen that is pure theatre - it is over
+      // inside a second and the cook's next dispatch overrides it.
+      const o = idx.byId.get(e.order);
+      const where = stationForStep(stepLabelAt(idx, e.order, e.tick), 'wait', 0, 1);
+      if (e.core != null) {
+        V.errands.set(e.core, { kind: 'carry', start: now, dur: 900, where, colour: o ? o.colour : '#c98f5a' });
+      }
+      break;
+    }
+    case 'dispatched': {
+      // Going to the larder for what the next step needs.
+      //
+      // The switch this belongs to is measured in *ticks*, and two ticks at
+      // four times speed is a single frame - so timing the walk off the
+      // simulation makes it invisible exactly when somebody is watching it.
+      // It runs on the wall clock instead, like the trip to the oven, and
+      // like that one it is theatre laid over a cook the engine has already
+      // committed. It ends the moment the cook is given something else.
+      const entry = ingredientFor(idx, idx.byId.get(e.order));
+      const busy = V.errands.get(e.core);
+      const rested = now - (V.fetchedAt.get(e.core) || -1e9) >= fetchDuration();
+      if (e.core != null && entry && !busy && rested) {
+        const dur = fetchDuration();
+        V.errands.set(e.core, { kind: 'fetch', start: now, dur, item: entry.item, order: e.order });
+        V.fetchedAt.set(e.core, now + dur);
+      }
+      break;
+    }
+    case 'unblocked':
+      V.fx.push({ kind: 'unblocked', id: e.order, from, start: now, dur: 600 });
+      break;
+    case 'forfeit':
+      flash(`run forfeited${e.message ? `: ${e.message}` : ''}`, 'warn');
+      break;
+    case 'finished':
+      flash(`service closed${e.message ? ` (${e.message})` : ''}`, 'warn');
+      break;
+    default: break;
+  }
+}
+
+function flash(text, kind) {
+  el.notice.textContent = text;
+  el.notice.className = `show ${kind || ''}`;
+  V.noticeUntil = performance.now() + 1800;
+}
+
+// ---- side panel ---------------------------------------------------------------
+
+/** Refreshes the DOM panels for integer tick `tick` (cheap; called once per tick). */
+function refreshPanels(tick, force) {
+  if (!force && tick === V.lastTick && !V.logDirty) return;
+  const idx = V.index;
+  const i = frameIndexAt(idx, tick);
+  const st = stateAt(idx, i);
+  if (force || tick !== V.lastTick) {
+    el.sbTick.textContent = String(tick);
+    el.sbClock.textContent = fmtClock(tick, idx.tickMs);
+    el.sbServed.textContent = String(st.served);
+    el.sbAbandoned.textContent = String(st.abandoned);
+    el.sbLive.textContent = String(st.liveCount);
+    el.sbSwitches.textContent = String(switchesSoFar(idx, tick));
+    el.sbUtil.textContent = pct(utilisationSoFar(idx, i));
+    el.pos.textContent = `tick ${tick} / ${idx.lastTick}`;
+    if (document.activeElement !== el.scrub) el.scrub.value = String(tick);
+    refreshDebug(tick);
+    refreshInspector(tick);
+  }
+  if (V.logDirty) {
+    el.log.innerHTML = V.log.map((e) =>
+      `<li class="${escapeHtml(e.kind)}"><span class="t">tick ${e.tick}</span><span>${escapeHtml(eventText(idx, e))}</span></li>`).join('')
+      || '<li class="muted">nothing yet</li>';
+    V.logDirty = false;
+  }
+  V.lastTick = tick;
+}
+
+function refreshDebug(tick) {
+  const entry = debugAt(V.index, tick);
+  if (!entry) {
+    el.dbgText.textContent = V.index.debug.length ? '–' : 'This scheduler attached no notes. (Use decision.annotate(text=…, queue=…, tags=…) in the SDK.)';
+    el.dbgText.className = 'muted';
+    el.dbgExtra.textContent = '';
+    return;
+  }
+  const p = normalisePayload(entry.payload);
+  el.dbgText.textContent = p.text || '(no text)';
+  el.dbgText.className = p.text ? '' : 'muted';
+  const bits = [];
+  if (p.queue) bits.push(`queue: [${p.queue.join(', ')}]`);
+  if (p.extra) bits.push(JSON.stringify(p.extra));
+  el.dbgExtra.textContent = `tick ${entry.tick}${bits.length ? ' · ' + bits.join(' · ') : ''}`;
+}
+
+function selectOrder(id) {
+  V.selected = id;
+  refreshInspector(Math.floor(V.time));
+}
+
+function refreshInspector(tick) {
+  const idx = V.index;
+  const o = V.selected == null ? null : idx.byId.get(V.selected);
+  if (!o) {
+    el.inspectorBody.className = 'muted small';
+    el.inspectorBody.innerHTML = 'Click a ticket, a cook or an oven dish to inspect the order. Click empty floor to clear.';
+    return;
+  }
+  const st = stateAt(idx, frameIndexAt(idx, tick));
+  const live = st.live.get(o.id);
+  let state;
+  if (live) {
+    const step = o.steps[live.step];
+    const label = step ? step.label : '';
+    if (live.st === 'ready') state = 'on the rail, waiting for a cook';
+    else if (live.st === 'blocked') state = `in the oven (${escapeHtml(label)})`;
+    else {
+      const core = live.core != null ? idx.frames[st.i].cores[live.core] : null;
+      state = core && core.s === 'switching'
+        ? `cook ${live.core} is switching to it (${core.r} tick${core.r === 1 ? '' : 's'} left)`
+        : `cook ${live.core} is on it (${escapeHtml(label)})`;
+    }
+  } else if (o.servedAt != null && o.servedAt <= tick) state = `served at tick ${o.servedAt}`;
+  else if (o.abandonedAt != null && o.abandonedAt <= tick) state = `walked out at tick ${o.abandonedAt}`;
+  else if (tick < o.arrival) state = 'not yet arrived';
+  else state = 'gone';
+
+  const left = o.deadline - tick;
+  const rows = [
+    ['order', `<span class="swatch" style="background:${o.colour}"></span><b>${escapeHtml(o.recipe)} #${o.id}</b>`],
+    ['priority', `${stars(o.priority)} (${o.priority})`],
+    ['state', state],
+    ['arrived', `tick ${o.arrival} (${fmtClock(o.arrival, idx.tickMs)})`],
+    ['deadline', `tick ${o.deadline} · patience ${o.patience} · ${live ? `<b>${left} left</b>` : `${left >= 0 ? left + ' left' : 'passed'}`}`],
+    ['waited', `${waitedAt(idx, o, tick)} ticks on the rail`],
+    ['dispatches', `${o.dispatches.filter((t) => t <= tick).length}`],
+    ['preemptions', `${o.preemptions.filter((t) => t <= tick).length}`],
+    ['work', `${o.totalWork} ticks total`],
+  ];
+  if (o.firstWorkAt != null && o.firstWorkAt <= tick) rows.push(['response', `${o.firstWorkAt - o.arrival} ticks to first work`]);
+  const steps = o.steps.map((s, k) => {
+    let remaining;
+    if (o.servedAt != null && o.servedAt <= tick) remaining = 0;
+    else if (live) remaining = k < live.step ? 0 : k === live.step ? live.rem : s.duration;
+    else if (o.abandonedAt != null && o.abandonedAt <= tick) remaining = s.duration; // unknown; the frames no longer carry it
+    else remaining = s.duration;
+    const done = s.duration > 0 ? clamp(1 - remaining / s.duration, 0, 1) : 1;
+    const cur = live && k === live.step;
+    return `<div class="step ${s.kind === 'wait' ? 'wait' : ''} ${cur ? 'current' : ''}">`
+      + `<span style="min-width:70px">${escapeHtml(s.label)}</span>`
+      + `<span class="muted" style="min-width:34px">${s.kind === 'wait' ? 'oven' : 'cook'}</span>`
+      + `<span class="bar"><i style="width:${(done * 100).toFixed(0)}%;background:${s.kind === 'wait' ? 'var(--muted)' : o.colour}"></i></span>`
+      + `<span class="muted" style="min-width:52px;text-align:right">${remaining}/${s.duration}</span></div>`;
+  }).join('');
+  el.inspectorBody.className = '';
+  el.inspectorBody.innerHTML = `<table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('')}</table><div class="steps">${steps}</div>`;
+}
+
+/** The result summary as HTML; `big` is the end-of-run overlay flavour. */
+/* ---- what the numbers mean -------------------------------------------------
+   One entry per column heading, as [name, how it is worked out, what it tells
+   you]. The formulas are the ones in sim-core/src/result.rs; if you change
+   them there, change them here. */
+const METRICS = {
+  score: ['score', '100 × Σ(component × weight) ÷ Σ weights',
+    'The six components below, each in [0, 1], multiplied by their weights, added, and divided by the weights own total. Zero if the run was forfeited.'],
+  ci95: ['confidence interval', '1.96 × standard error of the mean over the seeds',
+    'How much of the difference between two schedulers is noise. A gap smaller than this is not a result - run more seeds.'],
+  completion: ['completion', 'served ÷ orders',
+    'The share of customers served before they walked out. Weight 0.30, the largest single component.'],
+  response: ['response', 'mean(first tick of work − arrival), over orders a cook ever started',
+    'How long a customer waits before anything happens at all. Scored as 1 ÷ (1 + mean ÷ 25), so a mean of 25 ticks is half marks. Weight 0.125. This stops at the first tick of work - what happens after it is turnaround.'],
+  slowdown: ['bounded slowdown', 'mean(turnaround ÷ max(work, 10)), over served orders',
+    'How much longer an order took than the work in it - turnaround, divided. Bounded so a two-tick espresso that waited ten ticks is not counted as a six-fold delay. Scored as 1 ÷ mean, capped at 1. Weight 0.15.'],
+  switches: ['context switches', 'one per dispatch, each costing switch_cost ticks',
+    'Every time a cook takes on an order - from idle or from another order - it loses switch_cost ticks before any work happens.'],
+  necessary: ['necessary switches', 'necessary ÷ total, where necessary = the first dispatch of a work step',
+    'The share of switches any scheduler would have had to pay. 1 means you never resumed a step you had preempted. Weight 0.15.'],
+  fairness: ['fairness', "Jain's index over the served orders' bounded slowdowns",
+    '1 when every customer waited proportionally the same, 1/n when one order took everything. Weight 0.15.'],
+  turnaround: ['turnaround', '1 ÷ (1 + mean(served tick − arrival tick) ÷ 60)',
+    'How long a customer was in the room, start to finish - the wait for a cook, the cooking, every oven wait and every tick back on the rail. A mean of 60 ticks is half marks. Weight 0.125. Where response asks how long before anything happened and slowdown divides by the work in the order, this is the plain absolute number.'],
+  waiting: ['waiting', 'ticks spent on the rail, over served orders',
+    'Time an order sat ready with no cook on it.'],
+  utilisation: ['utilisation', 'work ticks ÷ (cooks × ticks)',
+    'The share of the kitchen that did useful work. What is missing went to switching or to idle cooks.'],
+  overhead: ['overhead', 'switch ticks ÷ (cooks × ticks)',
+    'The share of the kitchen spent switching. This is capacity nobody gets back.'],
+  throughput: ['throughput', 'served × 100 ÷ ticks',
+    'Orders served per hundred ticks.'],
+  makespan: ['makespan', 'the tick the last order was served',
+    'When the kitchen actually finished, as opposed to when service closed.'],
+  preemptions: ['preemptions', 'times an order was taken off a cook mid-step',
+    'The step keeps its progress, but somebody pays another switch to resume it. Each one costs you on the switching component.'],
+  invalid: ['invalid assignments', 'assignments the engine refused',
+    'An order that was in the oven, already served, on another cook - or one whose station was full. The rest of the decision still applied, but the cook you meant to use stayed as it was.'],
+  stations: ['station', 'places taken ÷ (capacity × ticks), and the share of ticks it was full',
+    'A station is a lock with capacity permits. The share of ticks it was full is the share of ticks it was the thing standing in the scheduler’s way.'],
+  ms: ['ms per decision', 'wall-clock time inside schedule()',
+    'Your scheduler’s own speed. A decision slower than the profile’s timeout is discarded and counted against you.'],
+  served: ['served', 'orders finished before the customer left', 'The same figure as completion, as a count.'],
+  abandoned: ['walked out', 'orders whose deadline passed unserved',
+    'Every tick a cook spent on one of these was wasted, however nearly done it was.'],
+};
+
+/* ---- the metric hover -------------------------------------------------------
+   Any element with data-metric="<key>" explains itself on hover. Positioned
+   from JavaScript rather than left to `title`, because a native tooltip takes
+   a second to appear and cannot show the formula on its own line. */
+function installMetricTips(root) {
+  let tip = document.getElementById("metric-tip");
+  if (!tip) {
+    tip = document.createElement("div");
+    tip.id = "metric-tip";
+    tip.hidden = true;
+    document.body.appendChild(tip);
+  }
+  const show = (target, x, y) => {
+    const entry = METRICS[target.dataset.metric];
+    if (!entry) return;
+    tip.innerHTML = `<div class="t">${escapeHtml(entry[0])}</div>`
+      + `<div class="f"><code>${escapeHtml(entry[1])}</code></div>`
+      + `<div class="n">${escapeHtml(entry[2])}</div>`;
+    tip.hidden = false;
+    const box = tip.getBoundingClientRect();
+    let left = x + 14, top = y + 16;
+    if (left + box.width > window.innerWidth - 8) left = x - box.width - 14;
+    if (top + box.height > window.innerHeight - 8) top = y - box.height - 16;
+    tip.style.left = `${Math.max(8, left)}px`;
+    tip.style.top = `${Math.max(8, top)}px`;
+  };
+  (root || document).addEventListener("pointermove", (e) => {
+    const target = e.target.closest ? e.target.closest("[data-metric]") : null;
+    if (target) show(target, e.clientX, e.clientY);
+    else tip.hidden = true;
+  });
+  (root || document).addEventListener("pointerleave", () => { tip.hidden = true; });
+}
+
+/** Every component, with the sum that produced it from this run's numbers.
+ *
+ * Reads the scales out of the run's own configuration rather than today's
+ * defaults, so an old replay is explained by the rules it was scored under.
+ * Returns `{rows, total, weightTotal}` with everything pre-formatted; the
+ * arithmetic is done here so the markup is only markup. */
+function scoreWorking(idx, r) {
+  const m = r.metrics || {}, s = r.score || {};
+  const w = weightsOf(idx, s) || {};
+  const cfg = (idx.config && idx.config.scoring) || {};
+  const responseScale = cfg.response_scale == null ? 25 : cfg.response_scale;
+  const turnaroundScale = cfg.turnaround_scale == null ? 60 : cfg.turnaround_scale;
+  const bound = cfg.slowdown_bound == null ? 10 : cfg.slowdown_bound;
+  const weightTotal = ['completion', 'response', 'turnaround', 'slowdown', 'switching', 'fairness']
+    .reduce((sum, k) => sum + (Number(w[k]) || 0), 0) || 1;
+  const d = (v, n) => num(v == null ? 0 : v, n == null ? 3 : n);
+  const mean = (dist) => (dist && Number.isFinite(dist.mean) ? dist.mean : 0);
+
+  const spec = [
+    ['completion', 'completion', s.completion,
+      `served ÷ orders = <b>${m.served ?? 0}</b> ÷ <b>${m.orders ?? 0}</b>`],
+    ['response', 'response', s.response,
+      `1 ÷ (1 + mean_response ÷ ${d(responseScale, 0)}) = 1 ÷ (1 + <b>${d(mean(m.response), 1)}</b> ÷ ${d(responseScale, 0)})`],
+    ['turnaround', 'turnaround', s.turnaround,
+      `1 ÷ (1 + mean_turnaround ÷ ${d(turnaroundScale, 0)}) = 1 ÷ (1 + <b>${d(mean(m.turnaround), 1)}</b> ÷ ${d(turnaroundScale, 0)})`],
+    ['slowdown', 'slowdown', s.slowdown,
+      `1 ÷ mean(turnaround ÷ max(work, ${d(bound, 0)})) = 1 ÷ <b>${d(mean(m.bounded_slowdown), 2)}</b>`],
+    ['switching', 'switching', s.switching,
+      `necessary ÷ all switches = <b>${m.necessary_switches ?? 0}</b> ÷ <b>${m.context_switches ?? 0}</b>`],
+    ['fairness', 'fairness', s.fairness,
+      `Jain's index over the <b>${m.served ?? 0}</b> served orders' bounded slowdowns`],
+  ];
+
+  const rows = [];
+  for (const [key, label, value, formula] of spec) {
+    const weight = Number(w[key]) || 0;
+    if (!weight) continue;
+    const v = Number(value) || 0;
+    const points = v * weight * 100 / weightTotal;
+    rows.push({
+      key, label, weight, value: v, points,
+      max: weight * 100 / weightTotal,
+      formula: `${formula} = <b>${d(v)}</b>`,
+      award: `<b>${d(v)}</b> × ${d(weight, 3)} ÷ ${d(weightTotal, 3)} × 100 = <b>${d(points, 1)}</b> points`,
+    });
+  }
+  return { rows, weightTotal, total: Number(s.total) || 0 };
+}
+
+/** The working, as markup. */
+function workingHtml(idx, r) {
+  const { rows, total } = scoreWorking(idx, r);
+  if (!rows.length) return '';
+  const body = rows.map((row) => `
+    <div class="row">
+      <div class="head"><b data-metric="${row.key}">${row.label}</b>
+        <span class="wt">weight ${num(row.weight, 3)}</span>
+        <span class="pts">${num(row.points, 1)} <span class="muted">of ${num(row.max, 1)}</span></span></div>
+      <div class="bar"><i style="width:${(clamp(row.value, 0, 1) * 100).toFixed(0)}%"></i></div>
+      <div class="calc"><div class="line"><code>${row.formula}</code></div>
+        <div class="line"><code>${row.award}</code></div></div>
+    </div>`).join('');
+  const sum = rows.map((row) => num(row.points, 1)).join(' + ');
+  const forfeited = r.forfeited
+    ? `<br><span style="color:var(--bad)">…but the run was forfeited, so the score is 0.</span>` : '';
+  return `<div class="work"><h4>How that score is worked out</h4>${body}`
+    + `<div class="sum"><code>${sum} = <b>${num(total, 1)}</b> out of 100</code>${forfeited}</div></div>`;
+}
+
+/** The weights a run was actually scored under, not today's defaults. */
+function weightsOf(idx, score) {
+  return (score && score.weights)
+    || (idx.config && idx.config.scoring && idx.config.scoring.weights)
+    || null;
+}
+
+function resultsHtml(idx, big) {
+  const r = idx.result;
+  if (!r) {
+    return `<p class="muted">The run has not finished, so there is no score yet.</p>`;
+  }
+  const s = r.score || {}, m = r.metrics || {};
+  const comps = [['completion', s.completion], ['response', s.response], ['turnaround', s.turnaround],
+                 ['slowdown', s.slowdown], ['switching', s.switching], ['fairness', s.fairness]]
+    .filter(([k]) => !weightsOf(idx, s) || weightsOf(idx, s)[k]);
+  const tipped = (key, text) => `<span data-metric="${key}">${text}</span>`;
+  const weights = weightsOf(idx, s);
+  const bars = comps.map(([k, v]) => {
+    const w = weights && Number.isFinite(weights[k]) ? ` <span class="muted">×${weights[k]}</span>` : '';
+    return `<span data-metric="${k}">${k}${w}</span><span class="bar"><i style="width:${(clamp(v || 0, 0, 1) * 100).toFixed(0)}%"></i></span><span class="n">${num((v || 0) * 100, 0)}</span>`;
+  }).join('');
+  const fmtD = (d) => d && Number.isFinite(d.mean) ? `${num(d.mean, 1)} (p95 ${num(d.p95, 0)})` : '–';
+  const kv = [
+    [tipped('served', 'served') + ' / ' + tipped('abandoned', 'walked out') + ' / unfinished', `<span style="color:var(--good)">${m.served ?? '–'}</span> / <span style="color:var(--bad)">${m.abandoned ?? '–'}</span> / ${m.unfinished ?? '–'} of ${m.orders ?? '–'}`],
+    [tipped('response', 'mean response'), fmtD(m.response)],
+    [tipped('turnaround', 'mean turnaround'), fmtD(m.turnaround)],
+    [tipped('slowdown', 'mean slowdown'), m.bounded_slowdown ? `${num(m.bounded_slowdown.mean, 2)} bounded · ${num(m.slowdown && m.slowdown.mean, 2)} raw` : fmtD(m.slowdown)],
+    [tipped('switches', 'context switches'), `${m.context_switches ?? '–'} (${m.switch_ticks ?? '–'} ticks) · ${tipped('preemptions', (m.preemptions ?? '–') + ' preemptions')}`],
+    [tipped('utilisation', 'utilisation'), `${pct(m.utilisation)} · ${tipped('overhead', 'overhead ' + pct(m.overhead))}`],
+    [tipped('fairness', 'fairness (Jain)'), num(m.fairness, 3)],
+    [tipped('throughput', 'throughput'), `${num(m.throughput, 2)} served per 100 ticks`],
+    ['ended', `${escapeHtml(r.terminal_reason || '–')} at tick ${r.ticks ?? '–'} · makespan ${m.makespan ?? '–'}`],
+    ['decisions', `${r.decisions ?? '–'} · errors ${r.policy_errors ?? 0} · timeouts ${r.policy_timeouts ?? 0} · ${tipped('invalid', 'invalid ' + (r.invalid_assignments ?? 0))}`],
+  ];
+  const failures = Array.isArray(r.failures) && r.failures.length
+    ? `<div class="fail"><b>Failures</b> (${r.failures.length}):<br>${r.failures.slice(0, 4).map((f) => escapeHtml(f)).join('<br>')}</div>` : '';
+  const forfeit = r.forfeited ? '<div class="fail">This run was forfeited: the score is zero.</div>' : '';
+  if (big) {
+    return `<div class="big" id="ov-title">${num(s.total, 1)}<span class="muted" style="font-size:24px"> / 100</span></div>`
+      + `<div class="sub">${escapeHtml(r.policy || '')} on ${escapeHtml(idx.kitchen.name || '')} · seed ${r.seed}</div>`
+      + workingHtml(idx, r)
+      + `<div class="grid"><div><span class="k">served</span><br><span class="v" style="color:var(--good)">${m.served ?? '–'}</span></div>`
+      + `<div><span class="k">walked out</span><br><span class="v" style="color:var(--bad)">${m.abandoned ?? '–'}</span></div>`
+      + `<div><span class="k">unfinished</span><br><span class="v">${m.unfinished ?? '–'}</span></div>`
+      + `<div><span class="k">mean response</span><br><span class="v">${num(m.response && m.response.mean, 1)}</span></div>`
+      + `<div><span class="k">mean turnaround</span><br><span class="v">${num(m.turnaround && m.turnaround.mean, 1)}</span></div>`
+      + `<div><span class="k">context switches</span><br><span class="v">${m.context_switches ?? '–'}</span></div></div>`
+      + forfeit + failures;
+  }
+  return `<div class="total">${num(s.total, 1)} <span class="muted" style="font-size:14px">/ 100</span></div>`
+    + `<div class="bars">${bars}</div>`
+    + `<div class="kv">${kv.map(([k, v]) => `<span class="muted">${k}</span><span class="n">${v}</span>`).join('')}</div>`
+    + forfeit + failures;
+}
+
+function showOverlay() {
+  if (!V.index) return;
+  el.ovBody.innerHTML = resultsHtml(V.index, true);
+  el.overlay.hidden = false;
+  // Focusing the close button scrolls it into view, which on a card taller
+  // than the window means opening it half way down. Focus first, then put it
+  // back at the top: the score is the first thing anybody wants to see.
+  el.ovClose.focus({ preventScroll: true });
+  const card = el.overlay.querySelector('.card');
+  if (card) card.scrollTop = 0;
+}
+function hideOverlay() { el.overlay.hidden = true; }
+
+// ---- layout & canvases ------------------------------------------------------
+
+/** How tall the two canvas panels may be, so that the control bar below them
+ *  stays on screen.
+ *
+ *  The timeline needs a row per cook and asks for that as a minimum. The
+ *  kitchen is the greedy one: its row grows to its maximum before the timeline
+ *  is flexed at all, so on a window with nothing to spare the kitchen is what
+ *  pushed the control bar off the bottom. It is handed what is actually left
+ *  instead. A maximum below `--kitchen-min` is ignored by the grid, which is
+ *  the behaviour wanted on a window too short for either panel: nothing can
+ *  fit, so the page scrolls, as it always did. */
+function layoutHeights() {
+  const cores = V.index ? V.index.cores : 2;
+  const ganttMin = GANTT_TOP + cores * GANTT_ROW_H + GANTT_LANE_H + 47;
+  el.ganttWrap.style.minHeight = `${ganttMin}px`;
+  // The bar is fixed, so the page has to reserve its room explicitly. Measured
+  // first, and every time: it wraps to two lines on a narrow window, and the
+  // measurements below are taken against the padding this sets.
+  el.app.style.setProperty('--controls-h', `${el.controls.offsetHeight}px`);
+  el.app.style.setProperty('--kitchen-min', `${cores > 6 ? 600 : 552}px`);
+  // Measured rather than assumed, so that changing the grid's padding or its
+  // row gap in the stylesheet cannot quietly put the bar back off screen. The
+  // timeline's horizontal scrollbar is part of what its row costs, and is zero
+  // where the platform draws scrollbars as an overlay.
+  const spacing = el.app.offsetHeight - (el.scoreboard.offsetHeight + el.kitchenWrap.offsetHeight
+    + el.ganttWrap.offsetHeight + el.controls.offsetHeight);
+  const scrollbar = el.ganttScroll.offsetHeight - el.ganttScroll.clientHeight;
+  const spare = window.innerHeight - el.scoreboard.offsetHeight - el.controls.offsetHeight - spacing;
+  el.app.style.setProperty('--kitchen-max',
+    `${clamp(spare - ganttMin - scrollbar, 0, cores > 6 ? 760 : 686)}px`);
+}
+
+/** The timeline canvas is sized to the scrollport, never to the run. */
+function resizeGantt() {
+  const port = el.ganttScroll;
+  if (!port || !V.index) return;
+  syncGanttTrack();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, port.clientWidth), h = Math.max(1, port.clientHeight);
+  const t = V.gantt;
+  t.w = w; t.h = h;
+  t.canvas.style.width = `${w}px`;
+  t.canvas.style.height = `${h}px`;
+  t.canvas.width = Math.round(w * dpr);
+  t.canvas.height = Math.round(h * dpr);
+  t.ctx = t.canvas.getContext('2d');
+  t.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  syncGanttTrack();
+}
+
+function resizeCanvas(target, wrap) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, wrap.clientWidth), h = Math.max(1, wrap.clientHeight);
+  target.w = w; target.h = h;
+  target.canvas.width = Math.round(w * dpr);
+  target.canvas.height = Math.round(h * dpr);
+  target.ctx = target.canvas.getContext('2d');
+  target.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+// ---- small drawing helpers ----------------------------------------------------
+
+function roundRect(ctx, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function fillText(ctx, text, x, y, size, colour, align, weight) {
+  ctx.font = `${weight || 400} ${size}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+  ctx.fillStyle = colour;
+  ctx.textAlign = align || 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, x, y);
+}
+function ellipsis(ctx, text, maxWidth) {
+  if (ctx.measureText(text).width <= maxWidth) return text;
+  let s = text;
+  while (s.length > 1 && ctx.measureText(s + '…').width > maxWidth) s = s.slice(0, -1);
+  return s + '…';
+}
+/** A progress ring: `p` in [0,1]. */
+function ring(ctx, x, y, r, p, colour, track) {
+  ctx.lineWidth = Math.max(2, r * 0.28);
+  ctx.strokeStyle = track || 'rgba(90,64,40,.16)';
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
+  ctx.strokeStyle = colour;
+  ctx.beginPath(); ctx.arc(x, y, r, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * clamp(p, 0, 1)); ctx.stroke();
+}
+/** Diagonal hatching inside a rectangle (used for oven steps and switching). */
+function hatch(ctx, x, y, w, h, colour) {
+  ctx.save();
+  ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+  ctx.strokeStyle = colour; ctx.lineWidth = 1.5;
+  for (let k = -h; k < w + h; k += 6) { ctx.beginPath(); ctx.moveTo(x + k, y + h); ctx.lineTo(x + k + h, y); ctx.stroke(); }
+  ctx.restore();
+}
+/** Colour of a patience bar: green while there is time, amber, then red. */
+function patienceColour(fraction) {
+  return fraction > 0.5 ? '#2f8055' : fraction > 0.2 ? '#d99a1f' : '#c4443c';
+}
+
+// ---- sprites ----------------------------------------------------------------
+
+/* 32 x 32 transparent icons from `assets/sprites`. They are decoration: every
+ * one of them is drawn *over* something the canvas already draws, so a missing
+ * file, a blocked request or an old build costs nothing but the picture. That
+ * is why `sprite()` returns null rather than throwing, and why every caller
+ * has a shape to fall back to. */
+const SPRITE_NAMES = [
+  'coffee-beans', 'espresso-cup', 'lettuce', 'tomato', 'cucumber', 'beef-patty',
+  'burger-bun', 'cheese-slice', 'carrot', 'onion', 'stock-pot', 'roast-joint',
+  'herbs', 'flour-sack', 'butter-block', 'egg', 'chopping-board', 'chef-knife',
+  'frying-pan', 'dinner-plate', 'oven-tray', 'order-ticket', 'wooden-crate',
+];
+
+/** What a recipe looks like on a ticket.
+ *
+ * Matched on the recipe's name, not its steps, so a menu this viewer has never
+ * seen still gets something recognisable - and a menu written for a different
+ * course gets the generic ticket rather than a wrong picture. */
+const RECIPE_SPRITES = [
+  [/espresso|coffee|americano|latte|flat.?white/i, 'coffee-beans'],
+  [/salad|slaw|greens/i, 'lettuce'],
+  [/burger|patty|steak|beef/i, 'beef-patty'],
+  [/soup|broth|stew|bisque|chowder/i, 'stock-pot'],
+  [/roast|joint|lamb|pork|chicken/i, 'roast-joint'],
+  [/banquet|feast|platter|sharing/i, 'dinner-plate'],
+  [/vip|tasting|degustation|amuse/i, 'herbs'],
+  [/bread|loaf|dough|bun|brioche|focaccia/i, 'flour-sack'],
+  [/croissant|pastry|laminat|danish|puff/i, 'butter-block'],
+  [/cake|sponge|custard|meringue|souffl/i, 'egg'],
+  [/tart|pie|quiche|galette/i, 'cheese-slice'],
+  [/pickle|cucumber|relish/i, 'cucumber'],
+  [/onion|allium|leek/i, 'onion'],
+  [/tomato|marinara|passata/i, 'tomato'],
+];
+
+/** What each recipe takes off the shelf.
+ *
+ * The engine has no notion of an ingredient - a recipe is a sequence of
+ * durations - so this is the viewer's own reading of the menu, matched on the
+ * recipe's name the same way its dish is. It decides what the larder is
+ * stocked with and, read backwards, which recipes each jar is for. A menu this
+ * viewer has never seen simply contributes nothing to the shelves. */
+const RECIPE_INGREDIENTS = [
+  [/espresso|coffee|americano|latte|flat.?white/i, ['coffee-beans', 'espresso-cup']],
+  [/salad|slaw|greens/i, ['lettuce', 'tomato', 'cucumber']],
+  [/burger|patty|steak|beef/i, ['beef-patty', 'burger-bun', 'cheese-slice']],
+  [/soup|broth|stew|bisque|chowder/i, ['carrot', 'onion', 'stock-pot']],
+  [/roast|joint|lamb|pork|chicken/i, ['roast-joint', 'herbs']],
+  [/banquet|feast|platter|sharing/i, ['roast-joint', 'butter-block', 'herbs']],
+  [/vip|tasting|degustation|amuse/i, ['herbs', 'egg']],
+  [/bread|loaf|dough|bun|brioche|focaccia/i, ['flour-sack', 'butter-block', 'egg']],
+  [/croissant|pastry|laminat|danish|puff/i, ['butter-block', 'flour-sack']],
+  [/cake|sponge|custard|meringue|souffl/i, ['egg', 'butter-block', 'flour-sack']],
+  [/tart|pie|quiche|galette/i, ['cheese-slice', 'egg', 'flour-sack']],
+];
+
+/** What a jar is called when it is hovered. */
+const INGREDIENT_NAMES = {
+  'coffee-beans': 'coffee beans', 'espresso-cup': 'cups', 'lettuce': 'lettuce',
+  'tomato': 'tomatoes', 'cucumber': 'cucumber', 'beef-patty': 'beef',
+  'burger-bun': 'buns', 'cheese-slice': 'cheese', 'carrot': 'carrots',
+  'onion': 'onions', 'stock-pot': 'stock', 'roast-joint': 'joints of meat',
+  'herbs': 'herbs', 'flour-sack': 'flour', 'butter-block': 'butter', 'egg': 'eggs',
+};
+
+/** The shelves: every ingredient this menu needs, and who needs it.
+ *
+ * Ordered by how many recipes want it, so when only some of the shelves fit
+ * the ones that fit are the ones that matter. */
+function larderStock(idx) {
+  if (idx.larderStock) return idx.larderStock;
+  const byItem = new Map();
+  for (const recipe of idx.recipes || []) {
+    const name = String(recipe.name || '');
+    const entry = RECIPE_INGREDIENTS.find(([re]) => re.test(name));
+    if (!entry) continue;
+    for (const item of entry[1]) {
+      if (!byItem.has(item)) byItem.set(item, []);
+      if (!byItem.get(item).includes(name)) byItem.get(item).push(name);
+    }
+  }
+  idx.larderStock = Array.from(byItem, ([item, recipes]) => ({ item, recipes }))
+    .sort((a, b) => b.recipes.length - a.recipes.length || a.item.localeCompare(b.item));
+  return idx.larderStock;
+}
+
+/** How long a trip to the larder is drawn for, whatever the switch cost is
+ *  in ticks. Long enough to read as a walk; short enough that a cook is not
+ *  still carrying a carrot when it should be plating. */
+const FETCH_MS = 820;
+
+/** The trip is shortened as the run is played faster, and a cook has to spend
+ *  as long back at its counter as the trip took before it goes again.
+ *
+ *  Without that, sixteen-times speed dispatches a cook every few milliseconds
+ *  and the walk never ends - the kitchen would look like nobody ever cooks.
+ *  Some trips going unshown at speed is the honest trade: they are closer
+ *  together than a screen can show. */
+function fetchDuration() {
+  return clamp(FETCH_MS * 4 / Math.max(4, V.speed || 1), 260, FETCH_MS);
+}
+
+/** The shelf an order sends a cook to.
+ *
+ * A recipe usually needs several things; the cook fetches one of them, chosen
+ * from the order's own id so that it is the same shelf every time that order
+ * is picked up rather than a different one each frame - and so that two orders
+ * of the same recipe do not always send their cooks to the same jar. */
+function ingredientFor(idx, order) {
+  if (!order) return null;
+  const wants = larderStock(idx).filter((e) => e.recipes.includes(order.recipe));
+  return wants.length ? wants[order.id % wants.length] : null;
+}
+
+/** The live trip to the larder for one cook, or null.
+ *
+ * Either the errand started when it was dispatched, or - for a switch long
+ * enough to see on its own - the first part of the switch itself. An errand
+ * belongs to the order it was started for: give the cook something else and
+ * it is over. */
+function fetchTrip(idx, view, c, now) {
+  const core = view.cores[c];
+  if (!core || core.o == null) return null;
+  const errand = V.errands.get(c);
+  if (errand && errand.kind === 'fetch') {
+    if (errand.order !== core.o || now - errand.start > errand.dur) {
+      V.errands.delete(c);
+    } else {
+      const phase = (now - errand.start) / errand.dur;
+      return { item: errand.item, atShelf: phase < 0.55, carrying: true };
+    }
+  }
+  if (core.s === 'switching' && core.progress < 0.55) {
+    const entry = ingredientFor(idx, idx.byId.get(core.o));
+    if (entry) return { item: entry.item, atShelf: true, carrying: true };
+  }
+  return null;
+}
+
+/** Which shelf each cook is on its way to right now, for lighting them up. */
+function fetchTargets(idx, view, now) {
+  const at = now == null ? performance.now() : now;
+  const out = new Map();
+  view.cores.forEach((core, c) => {
+    const trip = fetchTrip(idx, view, c, at);
+    if (trip && trip.atShelf) out.set(c, trip.item);
+  });
+  return out;
+}
+
+/** The prop that stands for each station and appliance. */
+const STATION_SPRITES = {
+  board: 'chopping-board',
+  pass: 'dinner-plate',
+  bar: 'espresso-cup',
+  hob: 'frying-pan',
+  grill: 'frying-pan',
+  oven: 'oven-tray',
+};
+
+/** Loaded images by name. A name that failed maps to null and is not retried. */
+const SPRITES = new Map();
+
+function loadSprites() {
+  for (const name of SPRITE_NAMES) {
+    if (SPRITES.has(name)) continue;
+    const img = new Image();
+    img.decoding = 'async';
+    img.onerror = () => SPRITES.set(name, null);
+    img.src = `assets/sprites/${encodeURIComponent(name)}.png`;
+    SPRITES.set(name, img);
+  }
+}
+
+/** A drawable sprite, or null while it is loading or if it never arrived. */
+function sprite(name) {
+  const img = name ? SPRITES.get(name) : null;
+  return img && img.complete && img.naturalWidth ? img : null;
+}
+
+function spriteForRecipe(name) {
+  const text = String(name || '');
+  for (const [re, file] of RECIPE_SPRITES) if (re.test(text)) return file;
+  return 'order-ticket';
+}
+
+/** Draws a sprite centred on (x, y) at `size` pixels. True if it drew. */
+function drawSprite(ctx, name, x, y, size, alpha) {
+  const img = sprite(name);
+  if (!img) return false;
+  if (alpha != null) ctx.globalAlpha = alpha;
+  ctx.drawImage(img, Math.round(x - size / 2), Math.round(y - size / 2), size, size);
+  if (alpha != null) ctx.globalAlpha = 1;
+  return true;
+}
+
+// ---- the kitchen ----------------------------------------------------------------
+
+/** Geometry of the kitchen for the current canvas size and core count. */
+function kitchenGeometry(waiting) {
+  const { w, h } = V.kitchen;
+  const idx = V.index;
+  const railTop = 8;
+  // Two rows of tickets when the panel is tall enough and there are enough
+  // orders to fill a second one - reserving a row nobody is on just leaves a
+  // stripe of empty rail.
+  const perRow = Math.max(1, Math.floor((w - 28) / (TICKET_W + TICKET_GAP)));
+  const allowed = h >= 640 ? 2 : 1;
+  const railRows = clamp(Math.ceil(Math.max(1, waiting || 0) / perRow), 1, allowed);
+  const railH = 38 + railRows * TICKET_H + (railRows - 1) * TICKET_GAP;
+  const floorTop = railTop + railH + 8, floorBottom = h - 8;
+  const floorH = floorBottom - floorTop;
+
+  const hatchX = 8, hatchW = 118;
+  const ovenW = clamp(Math.round(w * 0.23), 190, 270);
+  const ovenX = w - ovenW - 8;
+
+  // The appliance wall: the grill above, the oven below. Neither holds a cook.
+  const appTop = floorTop + 6, appH = floorH - 12;
+  const grill = { x: ovenX, y: appTop, w: ovenW, h: Math.round(appH * 0.38) };
+  const oven = { x: ovenX, y: grill.y + grill.h + 8, w: ovenW, h: appH - grill.h - 8 };
+
+  // The larder, where a cook goes for what the step needs on its way to the
+  // counter. It costs nothing - the trip fits inside the context switch the
+  // scheduler is paying for anyway - but it is what the switch looks like.
+  const larderW = 134;
+  const larder = { x: hatchX + hatchW + 10, y: appTop, w: larderW, h: appH };
+  const floorLeft = larder.x;
+  const floorRight = ovenX - 10;
+
+  // One counter per station, wide enough for the places at it, spread across
+  // whatever floor is left over rather than huddled in the middle.
+  const boxTop = floorTop + 6;
+  const boxH = clamp(floorH - 126, 236, 330);
+  const specs = idx.stations;
+  const wants = specs.map((s) => STATION_PAD * 2 + s.capacity * PLACE_W);
+  const bare = wants.reduce((a, b) => a + b, 0);
+  // An aisle between the larder and the first counter, wide enough to stand a
+  // cook in while it reaches for a shelf.
+  const aisle = 48;
+  const room = floorRight - (larder.x + larderW + aisle);
+  const scale = bare > room ? room / bare : 1;
+  const gap = specs.length > 1 ? clamp((room - bare * scale) / (specs.length - 1), 10, 110) : 0;
+  const spread = bare * scale + gap * (specs.length - 1);
+  const boxes = [];
+  let x = larder.x + larderW + aisle + Math.max(0, (room - spread) / 2);
+  specs.forEach((spec, i) => {
+    const bw = wants[i] * scale;
+    boxes.push({ spec, x, y: boxTop, w: bw, h: boxH, placeW: (bw - STATION_PAD * 2) / spec.capacity });
+    x += bw + gap;
+  });
+
+  return {
+    w, h, railTop, railH, railRows, floorTop, floorBottom, floorLeft, floorRight,
+    hatchX, hatchW, ovenX, ovenW, grill, oven, larder, boxes,
+    shelves: V.index ? larderShelves({ larder }, V.index).shelves : [],
+    passCounter: { x: hatchX, y: floorTop + 8, w: hatchW, h: 92 },
+    lanes: { walk: clamp(boxTop + boxH + 60, floorTop + 80, floorBottom - 58) },
+  };
+}
+
+/** Where every jar sits, so the cook can be sent to one and the shelf can be
+ *  lit up when it is. Cheap enough to work out afresh each frame. */
+function larderShelves(g, idx) {
+  const b = g.larder;
+  const stock = larderStock(idx);
+  const cols = b.w >= 118 ? 2 : 1;
+  const cellW = (b.w - 18) / cols, cellH = 52;
+  const top = b.y + 34, floorY = b.y + b.h - 26;
+  const rows = Math.max(1, Math.floor((floorY - top) / cellH));
+  const room = rows * cols;
+  const shown = stock.length > room ? stock.slice(0, room - 1) : stock.slice(0, room);
+  const shelves = shown.map((entry, k) => {
+    const x = b.x + 9 + (k % cols) * cellW, y = top + Math.floor(k / cols) * cellH;
+    return {
+      item: entry.item, recipes: entry.recipes, k,
+      x, y, w: cellW, h: cellH, cx: x + cellW / 2, cy: y + cellH / 2 - 1,
+    };
+  });
+  return { shelves, cols, cellW, cellH, top, hidden: stock.length - shown.length, stock };
+}
+
+/** Where a cook stands: place `i` at the station named `kind`, or the walkway. */
+function standAt(g, kind, i, n, item) {
+  if (kind === 'larder') {
+    // In the aisle beside the larder, level with the shelf it wants - so a
+    // cook fetching herbs walks to where the herbs are. Two cooks after the
+    // same jar stand shoulder to shoulder rather than on top of each other.
+    const spread = i - (n - 1) / 2;
+    const shelf = item ? (g.shelves || []).find((sh) => sh.item === item) : null;
+    const y = shelf ? shelf.cy : g.larder.y + g.larder.h - 66;
+    return {
+      x: g.larder.x + g.larder.w + 24 + spread * 26,
+      y: clamp(y, g.floorTop + 66, g.floorBottom - 56),
+      box: null, slot: 0, shelf,
+    };
+  }
+  const box = g.boxes.find((b) => b.spec.name === kind);
+  if (box) {
+    // Take the place it is holding when there is one, otherwise crowd in at
+    // the end - a cook is never drawn outside the counter it is working at.
+    const slot = Math.min(i, box.spec.capacity - 1);
+    return {
+      x: box.x + STATION_PAD + box.placeW * (slot + 0.5),
+      y: box.y + box.h - 56,
+      box, slot,
+    };
+  }
+  const spread = i - (n - 1) / 2;
+  const centre = (g.floorLeft + g.floorRight) / 2;
+  return {
+    x: clamp(centre + spread * 110, g.floorLeft + 40, g.floorRight - 40),
+    y: g.lanes.walk,
+    box: null, slot: 0,
+  };
+}
+
+/** Which of a station's places each cook heading there gets, by core id, so a
+ *  cook does not jump from place to place while it stands still. */
+function placeIndex(cores, core) {
+  return cores.filter((c) => c < core).length;
+}
+
+/** Stable slots: a dish keeps its place on the appliance until it comes off. */
+function assignSlots(map, ids) {
+  const live = new Set(ids);
+  for (const id of Array.from(map.keys())) if (!live.has(id)) map.delete(id);
+  const taken = new Set(map.values());
+  for (const id of ids) {
+    if (map.has(id)) continue;
+    let k = 0;
+    while (taken.has(k)) k++;
+    taken.add(k); map.set(id, k);
+  }
+  return map;
+}
+
+
+/** Which station the step an order is on right now belongs to.
+ *
+ * A wait holds nobody, so it is never at a station the profile declares: it
+ * sits on the grill or in the oven, chosen from its label. A work step goes
+ * where the profile says, and only falls back to the label when the replay
+ * predates stations. */
+function stationOf(idx, id, live) {
+  const o = idx.byId.get(id);
+  if (live.kind !== 'wait' && idx.contended) {
+    const step = o && o.steps ? o.steps[live.step] : null;
+    const declared = step && step.station != null ? idx.stations[step.station] : null;
+    if (declared) return declared.name;
+  }
+  return stationForStep(live.label, live.kind, live.step, o ? o.steps.length : 1);
+}
+
+/** Which steps of which recipes happen at each station, worked out once from
+ *  the menu. This is the answer to "when is the bar ever used?" - a station
+ *  with one recipe behind it and a station every order goes through are very
+ *  different constraints, and the menu is the only thing that says which. */
+function stationUsers(idx) {
+  if (idx.stationUsers) return idx.stationUsers;
+  const byStation = new Map();
+  for (const recipe of idx.recipes || []) {
+    for (const step of recipe.steps || []) {
+      const station = step.station;
+      if (!station) continue;
+      if (!byStation.has(station)) byStation.set(station, new Map());
+      const labels = byStation.get(station);
+      if (!labels.has(step.label)) labels.set(step.label, []);
+      labels.get(step.label).push(recipe.name);
+    }
+  }
+  idx.stationUsers = byStation;
+  return byStation;
+}
+
+/** How much of the recorded service each station was in use, and full. */
+function stationUsage(idx) {
+  if (idx.stationUsage) return idx.stationUsage;
+  const n = idx.stations.length;
+  const busy = new Array(n).fill(0), full = new Array(n).fill(0), sum = new Array(n).fill(0);
+  let frames = 0;
+  for (let i = 0; i < idx.frames.length; i++) {
+    const f = idx.frames[i];
+    const held = Array.isArray(f.stations) && f.stations.length === n
+      ? f.stations
+      : null;
+    if (!held) continue;
+    frames++;
+    for (let k = 0; k < n; k++) {
+      sum[k] += held[k];
+      if (held[k] > 0) busy[k]++;
+      if (held[k] >= idx.stations[k].capacity) full[k]++;
+    }
+  }
+  idx.stationUsage = idx.stations.map((s, k) => ({
+    frames,
+    inUse: frames ? busy[k] / frames : 0,
+    full: frames ? full[k] / frames : 0,
+    utilisation: frames ? sum[k] / (frames * Math.max(1, s.capacity)) : 0,
+  }));
+  return idx.stationUsage;
+}
+
+/** Places taken at each station: from the frame where it records them, and
+ *  from what the cooks are holding where it does not. */
+function stationLoad(idx, view) {
+  const held = new Array(idx.stations.length).fill(0);
+  const f = view.frame;
+  if (!f) return held;
+  if (Array.isArray(f.stations) && f.stations.length === held.length) {
+    for (let i = 0; i < held.length; i++) held[i] = f.stations[i];
+    return held;
+  }
+  if (f.cores.some((c) => c.st != null)) {
+    for (const c of f.cores) if (c.st != null && c.st < held.length) held[c.st]++;
+    return held;
+  }
+  for (const c of f.cores) {
+    if (c.o == null) continue;
+    const live = view.orders.get(c.o);
+    if (!live || live.kind === 'wait') continue;
+    const station = idx.stationByName.get(stationOf(idx, c.o, live));
+    if (station) held[station.index]++;
+  }
+  return held;
+}
+
+/** Whether a ready order could be started right now, as far as its station
+ *  is concerned - which is what the scheduler is up against. */
+function orderIsBlocked(idx, view, load, id) {
+  if (!idx.contended) return false;
+  const live = view.orders.get(id);
+  if (!live || live.kind === 'wait') return false;
+  const station = idx.stationByName.get(stationOf(idx, id, live));
+  return !!station && load[station.index] >= station.capacity;
+}
+
+
+function drawKitchen(now) {
+  const ctx = V.kitchen.ctx;
+  if (!ctx || !V.index) return;
+  const idx = V.index;
+  const view = interp(idx, V.time);
+  if (!view) return;
+  const g = kitchenGeometry(view.state.ready.length);
+  const tick = Math.floor(V.time);
+  V.hits = [];
+  const load = stationLoad(idx, view);
+
+  // Floor and walls.
+  ctx.clearRect(0, 0, g.w, g.h);
+  const floor = ctx.createLinearGradient(0, g.floorTop, 0, g.floorBottom);
+  floor.addColorStop(0, '#f5e3c8'); floor.addColorStop(1, '#eacfa8');
+  ctx.fillStyle = floor;
+  roundRect(ctx, 4, g.floorTop - 4, g.w - 8, g.floorBottom - g.floorTop + 8, 10); ctx.fill();
+  ctx.strokeStyle = 'rgba(138,116,97,.10)'; ctx.lineWidth = 1;
+  for (let x = 20; x < g.w; x += 40) { ctx.beginPath(); ctx.moveTo(x, g.floorTop); ctx.lineTo(x, g.floorBottom); ctx.stroke(); }
+  for (let y = g.floorTop + 20; y < g.floorBottom; y += 40) { ctx.beginPath(); ctx.moveTo(6, y); ctx.lineTo(g.w - 6, y); ctx.stroke(); }
+
+  // A waiting dish sits on the appliance its step names: things that sizzle go
+  // on the grill, things that take their time in the oven. Both are waits, so
+  // neither holds a cook - that is the whole point of a wait step.
+  const onGrill = [], inOven = [];
+  for (const id of view.state.blocked) {
+    const live = view.orders.get(id);
+    (live && stationOf(idx, id, live) === 'grill' ? onGrill : inOven).push(id);
+  }
+
+  const fetching = fetchTargets(idx, view, now);
+  drawRail(ctx, g, view, tick, load);
+  drawHatchAndDoor(ctx, g);
+  drawLarder(ctx, g, view, fetching);
+  for (const box of g.boxes) drawStationBox(ctx, box, load[box.spec.index], idx.contended);
+  drawAppliance(ctx, g.grill, 'GRILL', V.slots.grill, onGrill, view);
+  drawAppliance(ctx, g.oven, 'OVEN', V.slots.oven, inOven, view);
+  drawCooks(ctx, g, view, tick, now, fetching);
+  drawFx(ctx, g, now);
+}
+
+/** The larder: crates of everything, and where a cook goes on its way in. */
+function drawLarder(ctx, g, view, fetching) {
+  const idx = V.index;
+  const b = g.larder;
+  ctx.fillStyle = '#fffaf0'; roundRect(ctx, b.x, b.y, b.w, b.h, 12); ctx.fill();
+  ctx.strokeStyle = '#dcbf99'; ctx.lineWidth = 2; roundRect(ctx, b.x, b.y, b.w, b.h, 12); ctx.stroke();
+  fillText(ctx, 'LARDER', b.x + b.w / 2, b.y + 20, 16, '#8a7461', 'center', 700);
+
+  const { shelves, cols, cellW, cellH, top, hidden } = larderShelves(g, idx);
+  const wanted = new Set(fetching ? fetching.values() : []);
+
+  // How many orders of each recipe are in the room right now, so a shelf can
+  // say whether anybody actually wants it at this moment.
+  const liveByRecipe = new Map();
+  for (const [id] of view.orders) {
+    const o = idx.byId.get(id);
+    if (!o) continue;
+    liveByRecipe.set(o.recipe, (liveByRecipe.get(o.recipe) || 0) + 1);
+  }
+
+  for (const shelf of shelves) {
+    const inUse = wanted.has(shelf.item);
+    ctx.fillStyle = inUse ? 'rgba(245,196,81,.5)' : 'rgba(138,116,97,.10)';
+    roundRect(ctx, shelf.x + 2, shelf.y + 2, cellW - 4, cellH - 6, 6); ctx.fill();
+    if (inUse) {
+      // Somebody is on their way here. Saying which shelf is being emptied is
+      // what makes the walk mean anything.
+      ctx.strokeStyle = '#d99a1f'; ctx.lineWidth = 2;
+      roundRect(ctx, shelf.x + 2, shelf.y + 2, cellW - 4, cellH - 6, 6); ctx.stroke();
+    }
+    if (!drawSprite(ctx, shelf.item, shelf.cx, shelf.cy, Math.min(46, cellW - 8))) {
+      ctx.fillStyle = PALETTE[shelf.k % PALETTE.length];
+      roundRect(ctx, shelf.x + 8, shelf.y + 12, cellW - 20, cellH - 30, 3); ctx.fill();
+    }
+    const live = shelf.recipes.reduce((sum, r) => sum + (liveByRecipe.get(r) || 0), 0);
+    V.hits.push({
+      x: shelf.x + 2, y: shelf.y + 2, w: cellW - 4, h: cellH - 6, id: null,
+      tip: {
+        key: `larder:${shelf.item}:${live}:${inUse ? 1 : 0}`,
+        title: INGREDIENT_NAMES[shelf.item] || shelf.item.replace(/-/g, ' '),
+        colour: inUse ? '#d99a1f' : '#b07d3f',
+        rows: [
+          ['used for', shelf.recipes.map((r) => `<b>${escapeHtml(r)}</b>`).join(', ')],
+          ['in the room now', live === 0 ? 'nothing on the menu needs it right now'
+            : `${live} live order${live === 1 ? '' : 's'} of ${shelf.recipes.length === 1 ? 'it' : 'those'}`],
+        ],
+        footer: inUse
+          ? 'A cook is on its way here now.'
+          : 'A cook collects what its next step needs on the way to the counter. The trip is drawn inside the context switch, which is what the scheduler is already paying for.',
+      },
+    });
+  }
+
+  if (hidden > 0) {
+    const k = shelves.length;
+    const x = b.x + 9 + (k % cols) * cellW, y = top + Math.floor(k / cols) * cellH;
+    ctx.fillStyle = 'rgba(138,116,97,.10)';
+    roundRect(ctx, x + 2, y + 2, cellW - 4, cellH - 6, 6); ctx.fill();
+    fillText(ctx, `+${hidden}`, x + cellW / 2, y + cellH / 2, 17, '#8a7461', 'center', 700);
+  }
+
+  fillText(ctx, shelves.length ? 'ingredients' : 'nothing on this menu',
+           b.x + b.w / 2, b.y + b.h - 12, 14, '#9c8878', 'center', 500);
+  V.hits.push({
+    x: b.x, y: b.y, w: b.w, h: 30, id: null,
+    tip: {
+      key: 'larder',
+      title: 'the larder',
+      colour: '#b07d3f',
+      rows: [['holds', `${shelves.length + Math.max(0, hidden)} ingredient${shelves.length === 1 ? '' : 's'} across ${(idx.recipes || []).length} recipes`],
+             ['hover a jar', 'to see which recipes want it']],
+    },
+  });
+}
+
+/** One station counter, with a marked-out place for every cook that fits. */
+function drawStationBox(ctx, box, held, counted) {
+  const { spec, x, y, w, h, placeW } = box;
+  const full = counted && held >= spec.capacity;
+  ctx.fillStyle = '#e3bd90'; roundRect(ctx, x, y, w, h, 12); ctx.fill();
+  ctx.fillStyle = '#f0d6ae'; roundRect(ctx, x, y, w, 14, 12); ctx.fill();
+  ctx.strokeStyle = full ? 'rgba(196,68,60,.8)' : 'rgba(140,98,62,.3)';
+  ctx.lineWidth = 2.5; roundRect(ctx, x, y, w, h, 10); ctx.stroke();
+
+  const count = counted ? `${held}/${spec.capacity}` : '';
+  ctx.font = '800 20px system-ui, sans-serif';
+  const countW = count ? ctx.measureText(count).width : 0;
+  ctx.font = '700 17px system-ui, sans-serif';
+  let title = spec.label.toUpperCase();
+  const inner = w - STATION_PAD * 2;
+  if (ctx.measureText(title).width > inner - countW - 12) title = spec.name.toUpperCase();
+  // A one-place counter is narrow. Rather than shave the name down to an
+  // initial, stack the name over the count and start the mats lower.
+  const stacked = ctx.measureText(title).width > inner - countW - 12;
+  const matTop = stacked ? 66 : 44;
+  if (stacked) {
+    fillText(ctx, ellipsis(ctx, title, inner), x + w / 2, y + 26, 17, '#5a4028', 'center', 700);
+    fillText(ctx, count, x + w / 2, y + 50, 20, full ? '#c4443c' : '#2f9a68', 'center', 800);
+  } else {
+    fillText(ctx, title, x + STATION_PAD, y + 32, 17, '#5a4028', 'left', 700);
+    fillText(ctx, count, x + w - STATION_PAD, y + 32, 20, full ? '#c4443c' : '#2f9a68', 'right', 800);
+  }
+  // The tool of the trade, faint on the counter top behind the places.
+  drawSprite(ctx, STATION_SPRITES[spec.name], x + w - 32, y + h - 28, 46, .62);
+
+  // The places themselves: a mat on the counter for each, dashed while empty.
+  for (let k = 0; k < spec.capacity; k++) {
+    const px = x + STATION_PAD + placeW * k, taken = k < held;
+    ctx.save();
+    ctx.setLineDash(taken ? [] : [6, 6]);
+    ctx.strokeStyle = taken ? 'rgba(90,64,40,.52)' : 'rgba(90,64,40,.3)';
+    ctx.lineWidth = 2;
+    roundRect(ctx, px + 5, y + matTop, placeW - 10, h - matTop - 12, 8); ctx.stroke();
+    ctx.restore();
+    if (!taken && counted) {
+      fillText(ctx, 'free', px + placeW / 2, y + h - 22, 16, 'rgba(90,64,40,.58)', 'center', 600);
+    }
+  }
+  V.hits.push({ x, y, w, h, id: null, tip: stationTip(V.index, spec, held, counted, full) });
+}
+
+/** The grill and the oven: dishes waiting, in stable slots, holding nobody. */
+function drawAppliance(ctx, box, title, slots, ids, view) {
+  const idx = V.index;
+  ctx.fillStyle = '#dff0e7'; roundRect(ctx, box.x, box.y, box.w, box.h, 12); ctx.fill();
+  ctx.strokeStyle = '#a9cbb6'; ctx.lineWidth = 2; roundRect(ctx, box.x, box.y, box.w, box.h, 12); ctx.stroke();
+  fillText(ctx, `${title} · ${ids.length}`, box.x + 12, box.y + 20, 16, '#8a7461', 'left', 700);
+  fillText(ctx, 'no cook needed', box.x + 12, box.y + 38, 13, '#9c8878', 'left', 500);
+  drawSprite(ctx, title === 'GRILL' ? 'frying-pan' : 'oven-tray', box.x + box.w - 28, box.y + 28, 44, .7);
+
+  assignSlots(slots, ids);
+  const slotH = 62;
+  const cols = box.w >= 210 ? 2 : 1;
+  const slotW = (box.w - 20) / cols;
+  const top = box.y + 50;
+  const maxSlots = Math.max(cols, Math.floor((box.y + box.h - 8 - top) / slotH) * cols);
+  let overflow = 0;
+  for (const [id, slot] of slots) {
+    if (slot >= maxSlots) { overflow++; continue; }
+    const o = idx.byId.get(id), live = view.orders.get(id);
+    if (!o || !live) continue;
+    const x = box.x + 10 + (slot % cols) * slotW, y = top + Math.floor(slot / cols) * slotH;
+    const cx = x + 26, cy = y + slotH / 2 - 3;
+    const glow = ctx.createRadialGradient(cx, cy, 3, cx, cy, 26);
+    glow.addColorStop(0, 'rgba(255,140,60,.32)'); glow.addColorStop(1, 'rgba(255,140,60,0)');
+    ctx.fillStyle = glow; ctx.fillRect(x, y, slotW, slotH);
+    ring(ctx, cx, cy, 22, live.progress, '#dd8a3c');
+    if (!drawSprite(ctx, spriteForRecipe(o.recipe), cx, cy, 34)) {
+      ctx.fillStyle = o.colour; ctx.beginPath(); ctx.arc(cx, cy, 8, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.font = '700 16px system-ui, sans-serif';
+    fillText(ctx, ellipsis(ctx, `#${o.id}`, slotW - 56), x + 52, cy - 9, 16, '#3d2f26', 'left', 700);
+    ctx.font = '500 14px system-ui, sans-serif';
+    fillText(ctx, ellipsis(ctx, `${Math.ceil(live.rem)} left`, slotW - 56), x + 52, cy + 11, 14, '#dd8a3c', 'left', 500);
+    V.lastPos.set(id, { x, y, w: slotW, h: slotH - 4 });
+    V.hits.push({ x, y, w: slotW, h: slotH - 4, id, tip: orderTip(idx, view, id) });
+  }
+  if (overflow) fillText(ctx, `+${overflow}`, box.x + box.w - 12, box.y + box.h - 12, 15, '#8a7461', 'right', 700);
+}
+
+
+
+
+/** The ticket rail: ready orders as cards, in the scheduler's declared order. */
+function drawRail(ctx, g, view, tick, load) {
+  const idx = V.index;
+  const dbg = debugAt(idx, tick);
+  const payload = normalisePayload(dbg ? dbg.payload : null);
+  const ready = railOrder(view.state.ready, payload.queue);
+  const stalled = ready.filter((id) => orderIsBlocked(idx, view, load, id)).length;
+
+  // Every live order is in exactly one of these three, which is the whole of
+  // an order's life in the kitchen and the whole of a process's life in an
+  // operating system. Showing them together makes that the first thing on
+  // screen rather than something to be inferred from where things are drawn.
+  const running = view.state.running.slice().sort((a, b) => a - b);
+  const blocked = view.state.blocked.slice().sort((a, b) => a - b);
+  const queues = [
+    { key: 'ready', title: 'READY', colour: '#8a7461', ids: ready,
+      note: payload.queue ? 'in the scheduler’s order' : 'arrival order',
+      tip: 'Waiting for a cook. This is the ready queue, and it is the list you choose from.' },
+    { key: 'running', title: 'RUNNING', colour: '#2f8055', ids: running,
+      note: 'on a cook',
+      tip: 'Assigned to a cook - including while that cook is still paying the context switch, when no work is happening yet.' },
+    { key: 'blocked', title: 'BLOCKED', colour: '#dd8a3c', ids: blocked,
+      note: 'on the oven or grill',
+      tip: 'On a wait step. These hold no cook and no station, and nobody can be assigned to them. They come back to READY on their own.' },
+  ];
+
+  ctx.fillStyle = '#f8ecd8';
+  roundRect(ctx, 4, g.railTop, g.w - 8, g.railH, 12); ctx.fill();
+
+  const cardW = TICKET_W, gap = TICKET_GAP, cardH = TICKET_H;
+  const slot = cardW + gap;
+  // Space is handed out in whole cards, not in pixels. A queue measured by its
+  // share of the orders can end up with ninety pixels and a card that needs a
+  // hundred, and then a queue with two orders in it shows neither of them.
+  const columns = Math.max(queues.length, Math.floor((g.w - 34) / slot));
+  const wants = queues.map((q) => Math.max(q.ids.length ? 1 : 0, Math.ceil(q.ids.length / g.railRows)));
+  const given = queues.map((_, i) => (wants[i] ? 1 : 0));
+  let spare = columns - given.reduce((a, b) => a + b, 0);
+  // Everybody who needs a second column gets one before anybody gets a third.
+  while (spare > 0) {
+    let best = -1, bestGap = 0;
+    for (let i = 0; i < queues.length; i++) {
+      const short = wants[i] - given[i];
+      if (short > bestGap) { bestGap = short; best = i; }
+    }
+    if (best < 0) break;
+    given[best]++; spare--;
+  }
+  // Anything still going spare goes to READY: it is the queue that grows.
+  if (spare > 0) given[0] += spare;
+
+  let x = 14;
+  queues.forEach((q, i) => {
+    q.columns = Math.max(1, given[i]);
+    q.w = q.columns * slot;
+    q.x = x;
+    x += q.w + 8;
+  });
+
+  for (let i = 0; i < queues.length; i++) {
+    const q = queues[i];
+    // Each queue is its own panel rather than a stretch of rail with a hairline
+    // through it: three states is the point being made, and a one-pixel line
+    // was not making it.
+    const px = q.x - 6, pw = q.w - 2, py = g.railTop + 4, ph = g.railH - 8;
+    ctx.fillStyle = 'rgba(255,255,255,.62)';
+    roundRect(ctx, px, py, pw, ph, 9); ctx.fill();
+    ctx.strokeStyle = q.colour; ctx.globalAlpha = .34; ctx.lineWidth = 2;
+    roundRect(ctx, px, py, pw, ph, 9); ctx.stroke();
+    ctx.globalAlpha = 1;
+    // A solid tab of the queue's colour down its left edge.
+    ctx.fillStyle = q.colour;
+    roundRect(ctx, px + 1, py + 8, 5, ph - 16, 3); ctx.fill();
+    fillText(ctx, `${q.title} · ${q.ids.length}`, q.x + 6, g.railTop + 15, 16, q.colour, 'left', 800);
+    ctx.font = '500 13px system-ui, sans-serif';
+    const room = q.w - 16 - ctx.measureText(`${q.title} · ${q.ids.length}`).width - 12;
+    // The READY queue says how many of it cannot actually be started, because
+    // that is the difference between a queue and a queue you can serve.
+    // How many are not shown is on the "+N" card already; the note says what
+    // the queue *is*, which is the part that has to be learned.
+    const note = q.key === 'ready' && stalled ? `${stalled} blocked by a full station` : q.note;
+    if (room > 60) {
+      fillText(ctx, ellipsis(ctx, note, room), q.x + q.w - 12, g.railTop + 15, 13,
+               q.key === 'ready' && stalled ? '#c4443c' : '#8a7461', 'right', 500);
+    }
+
+    const perRow = q.columns;
+    const maxCards = Math.max(1, Math.min(MAX_TICKETS, perRow * g.railRows));
+    // Never spend the only card on the "and N more" card.
+    const shown = q.ids.length > maxCards ? q.ids.slice(0, Math.max(1, maxCards - 1)) : q.ids;
+    const at = (k) => ({
+      x: q.x + 4 + (k % perRow) * slot,
+      y: g.railTop + 30 + Math.floor(k / perRow) * (cardH + gap),
+    });
+    shown.forEach((id, k) => {
+      const p = at(k);
+      drawTicket(ctx, idx, view, id, p.x, p.y, cardW, cardH, payload.tags.get(id), tick);
+      if (q.key === 'ready' && orderIsBlocked(idx, view, load, id)) {
+        // Ready, first in line, and still not startable: its station is full.
+        ctx.fillStyle = 'rgba(255,247,235,.72)';
+        roundRect(ctx, p.x, p.y, cardW, cardH, 9); ctx.fill();
+        ctx.strokeStyle = 'rgba(196,68,60,.85)'; ctx.lineWidth = 2;
+        roundRect(ctx, p.x + 1, p.y + 1, cardW - 2, cardH - 2, 9); ctx.stroke();
+        const live = view.orders.get(id);
+        fillText(ctx, `${live ? stationOf(idx, id, live) : ''} full`, p.x + cardW / 2, p.y + cardH - 18,
+                 16, '#c4443c', 'center', 700);
+      }
+      if (q.key !== 'ready') {
+        // A thin flag in the queue's colour, so a glance sorts the three.
+        ctx.fillStyle = q.colour;
+        roundRect(ctx, p.x + cardW - 10, p.y + 12, 6, cardH - 24, 3); ctx.fill();
+      }
+    });
+    if (q.ids.length > shown.length && shown.length < maxCards) {
+      const p = at(shown.length);
+      ctx.fillStyle = '#f0dfc6'; roundRect(ctx, p.x, p.y, cardW, cardH, 9); ctx.fill();
+      fillText(ctx, `+${q.ids.length - shown.length}`, p.x + cardW / 2, p.y + cardH / 2, 20, '#3d2f26', 'center', 700);
+      V.hits.push({
+        x: p.x, y: p.y, w: cardW, h: cardH, id: null,
+        tip: { key: `more:${q.key}`, title: `${q.ids.length - shown.length} more ${q.title.toLowerCase()}`,
+               colour: q.colour, rows: [['not shown', 'the panel has run out of room, not the kitchen']] },
+      });
+    }
+    if (!q.ids.length) {
+      fillText(ctx, 'empty', q.x + q.w / 2 - 4, g.railTop + 30 + cardH / 2, 16, '#c3ac91', 'center', 500);
+    }
+    V.hits.push({
+      x: q.x - 6, y: g.railTop + 4, w: q.w - 2, h: 26, id: null,
+      tip: { key: `queue:${q.key}:${q.ids.length}`, title: `${q.title} · ${q.ids.length} orders`,
+             colour: q.colour, rows: [['what it is', q.tip]],
+             footer: q.key === 'ready' && stalled
+               ? `${stalled} of them cannot be started right now: the station they need is full.`
+               : null },
+    });
+  }
+}
+
+/** One order card. Used on the rail, in a cook's hands and in the oven. */
+function drawTicket(ctx, idx, view, id, x, y, w, h, tag, tick, compact) {
+  const o = idx.byId.get(id);
+  if (!o) return;
+  const live = view.orders.get(id);
+  ctx.fillStyle = '#fffdf7';
+  roundRect(ctx, x, y, w, h, 9); ctx.fill();
+  ctx.fillStyle = o.colour; ctx.fillRect(x, y, w, 7);
+  // A card on a cream floor needs an edge of its own, or it dissolves into it.
+  ctx.strokeStyle = '#e0c8a4'; ctx.lineWidth = 1.5; roundRect(ctx, x, y, w, h, 9); ctx.stroke();
+  if (o.priority >= 3) { ctx.strokeStyle = '#d99a1f'; ctx.lineWidth = 2.5; roundRect(ctx, x, y, w, h, 9); ctx.stroke(); }
+  // The dish, if we have a picture of it. It sits beside the order number
+  // rather than beside the name: the name is what a card is looked up by, and
+  // squeezing "banquet" down to "ban..." to make room for a picture of one is
+  // a poor trade. The picture is the second way to recognise it, not the first.
+  const drewDish = drawSprite(ctx, spriteForRecipe(o.recipe), x + w - 27, y + 52, 44);
+  ctx.font = '600 18px system-ui, sans-serif';
+  fillText(ctx, ellipsis(ctx, o.recipe, w - 14), x + 8, y + 26, 18, '#3d2f26', 'left', 600);
+  // The stars are dropped rather than cut short when the picture leaves no
+  // room for them: half a row of stars says nothing, and a VIP's card is
+  // outlined in gold anyway. The exact priority is in the hover.
+  ctx.font = '500 16px system-ui, sans-serif';
+  const room = w - 16 - (drewDish ? 46 : 0);
+  const withStars = `#${o.id} ${stars(o.priority)}`;
+  const label = ctx.measureText(withStars).width <= room ? withStars : `#${o.id}`;
+  fillText(ctx, ellipsis(ctx, label, room), x + 8, y + 50, 16,
+           o.priority >= 3 ? '#a06a00' : '#9c8878', 'left', 500);
+  if (!compact) {
+    // Patience bar: how much of the customer's patience is left.
+    const left = clamp((o.deadline - V.time) / Math.max(1, o.patience), 0, 1);
+    ctx.fillStyle = '#ece0cc'; roundRect(ctx, x + 7, y + h - 26, w - 14, 7, 3); ctx.fill();
+    ctx.fillStyle = patienceColour(left); roundRect(ctx, x + 7, y + h - 26, (w - 14) * left, 7, 3); ctx.fill();
+    // Step strip: done steps solid, current partial, oven steps hatched.
+    const n = o.steps.length, sw = (w - 14 - (n - 1) * 3) / n;
+    for (let k = 0; k < n; k++) {
+      const s = o.steps[k];
+      const sx = x + 7 + k * (sw + 3), sy = y + h - 15;
+      ctx.fillStyle = '#e3d6c0'; ctx.fillRect(sx, sy, sw, 7);
+      let done = 0;
+      if (live) done = k < live.step ? 1 : k === live.step ? live.progress : 0;
+      if (s.kind === 'wait') hatch(ctx, sx, sy, sw, 7, '#8a7461');
+      ctx.fillStyle = s.kind === 'wait' ? '#8a7461' : o.base;
+      ctx.fillRect(sx, sy, sw * done, 7);
+    }
+  }
+  if (tag) fillText(ctx, ellipsis(ctx, tag, w + 10), x + w / 2, y + h + 10, 13, '#d99a1f', 'center', 600);
+  V.lastPos.set(id, { x, y, w, h });
+  V.hits.push({ x, y, w, h, id, tip: orderTip(idx, view, id) });
+}
+
+function drawHatchAndDoor(ctx, g) {
+  const state = V.index ? stateAt(V.index, frameIndexAt(V.index, Math.floor(V.time))) : null;
+  // The pass, where served dishes go out.
+  const y1 = g.floorTop + 8, boxH = 96;
+  ctx.fillStyle = '#e2f3e7'; roundRect(ctx, g.hatchX, y1, g.hatchW, boxH, 10); ctx.fill();
+  ctx.strokeStyle = '#5fa87d'; ctx.lineWidth = 2.5; roundRect(ctx, g.hatchX, y1, g.hatchW, boxH, 10); ctx.stroke();
+  drawSprite(ctx, 'dinner-plate', g.hatchX + g.hatchW - 26, y1 + 24, 42, .6);
+  fillText(ctx, 'PASS', g.hatchX + g.hatchW / 2, y1 + 22, 17, '#2f8055', 'center', 700);
+  fillText(ctx, 'served →', g.hatchX + g.hatchW / 2, y1 + 44, 14, '#8a7461', 'center', 500);
+  fillText(ctx, String(state ? state.served : 0), g.hatchX + g.hatchW / 2, y1 + 72, 26, '#2f8055', 'center', 700);
+  // The door, where customers walk out.
+  const y2 = g.floorBottom - boxH - 8;
+  ctx.fillStyle = '#fde5e2'; roundRect(ctx, g.hatchX, y2, g.hatchW, boxH, 10); ctx.fill();
+  ctx.strokeStyle = '#e09a92'; ctx.lineWidth = 2.5; roundRect(ctx, g.hatchX, y2, g.hatchW, boxH, 10); ctx.stroke();
+  fillText(ctx, 'DOOR', g.hatchX + g.hatchW / 2, y2 + 22, 17, '#c4443c', 'center', 700);
+  fillText(ctx, 'walked out', g.hatchX + g.hatchW / 2, y2 + 44, 14, '#8a7461', 'center', 500);
+  fillText(ctx, String(state ? state.abandoned : 0), g.hatchX + g.hatchW / 2, y2 + 72, 26, '#c4443c', 'center', 700);
+  V.hatch = { x: g.hatchX + g.hatchW / 2, y: y1 + 48 };
+  V.door = { x: g.hatchX + g.hatchW / 2, y: y2 + 48 };
+}
+
+
+/** One cook at their station, with whatever they are holding. */
+function drawCooks(ctx, g, view, tick, now, fetching) {
+  const idx = V.index;
+  const dt = V.lastDrawNow ? Math.min(140, now - V.lastDrawNow) : 0;
+  const jumped = Math.abs(V.time - V.lastDrawTime) > 4;
+  V.lastDrawNow = now; V.lastDrawTime = V.time;
+  if (jumped) { V.errands.clear(); V.fetchedAt.clear(); }
+
+  // Where each cook is heading. A context switch is a walk: to the larder for
+  // what the next step needs, and then to the counter it happens at. That walk
+  // is not decoration - it is the switch cost the scheduler paid, drawn at the
+  // speed it is actually charged. An errand overrides both: a dish that has
+  // just gone into the oven has to be carried there.
+  const trips = view.cores.map((_, c) => fetchTrip(idx, view, c, now));
+  const want = view.cores.map((core, c) => {
+    const live = core.o != null ? view.orders.get(core.o) : null;
+    if (!live) return 'idle';
+    if (trips[c] && trips[c].atShelf) return 'larder';
+    return stationOf(idx, core.o, live);
+  });
+  const groups = new Map();
+  want.forEach((kind, c) => { const a = groups.get(kind) || []; a.push(c); groups.set(kind, a); });
+
+  for (let c = 0; c < view.cores.length; c++) {
+    const core = view.cores[c];
+    const peers = groups.get(want[c]);
+    const trip = trips[c];
+    const wantedItem = trip ? trip.item : null;
+    let spot = standAt(g, want[c], peers.indexOf(c), peers.length, wantedItem);
+
+    // An errand: carrying a dish to the appliance it is going to wait on.
+    const errand = V.errands.get(c);
+    let carrying = null;
+    if (errand && errand.kind === 'carry') {
+      const age = now - errand.start;
+      if (age > errand.dur) V.errands.delete(c);
+      else if (age < errand.dur * 0.62) {
+        const box = errand.where === 'grill' ? g.grill : g.oven;
+        spot = { x: box.x - 34, y: clamp(box.y + box.h / 2, g.floorTop + 70, g.floorBottom - 60), box: null, slot: 0 };
+        carrying = errand.colour;
+      }
+    }
+
+    let p = V.cookPos.get(c);
+    if (!p || jumped) { p = { x: spot.x, y: spot.y }; V.cookPos.set(c, p); }
+    const dx = spot.x - p.x, dy = spot.y - p.y;
+    const near = Math.hypot(dx, dy) < 3.5;
+    const k = dt > 0 ? 1 - Math.exp(-dt / 95) : 0;
+    p.x += dx * k; p.y += dy * k;
+
+    const working = core.s === 'working' && near && !carrying;
+    const walking = !near || !!carrying;
+    const action = working ? ACTION_OF[want[c]] || 'chop' : null;
+    const colour = COOK_COLOURS[c % COOK_COLOURS.length];
+    const held = core.o != null ? idx.byId.get(core.o) : null;
+    const bob = working ? Math.sin(now / 90) * 3 : walking ? Math.abs(Math.sin(now / 110)) * 6 : Math.sin(now / 600) * 2;
+    const y = p.y - bob;
+    const atLarder = !!trip && !carrying;
+
+    drawCook(ctx, p.x, y, colour, {
+      working, walking, action, now, held, carrying,
+      fetching: atLarder && !working, picked: wantedItem,
+      dir: dx >= 0 ? 1 : -1, scale: COOK_SCALE,
+    });
+    fillText(ctx, `cook ${c}`, p.x, y + 66, 15, colour, 'center', 700);
+
+    // What the cook is on. In the place it is standing in when it is at a
+    // counter - so two cooks side by side never write over each other - and in
+    // a bubble over its head while it is crossing the floor.
+    if (core.o != null) {
+      const live = view.orders.get(core.o);
+      const o = idx.byId.get(core.o);
+      if (o && live) {
+        const switching = core.s === 'switching';
+        const tint = switching ? '#d99a1f' : o.base;
+        const progress = switching ? core.progress : live.progress;
+        const text = carrying ? 'to the oven'
+          : switching ? `switching ${Math.ceil(core.r)}`
+          : `${live.label} ${Math.ceil(live.rem)}`;
+        if (spot.box && near && !carrying) {
+          const b = spot.box;
+          const px = b.x + STATION_PAD + b.placeW * spot.slot;
+          const cx = px + b.placeW / 2;
+          // A counter with four places at it gets narrow ones, and "prep 52"
+          // cut to "prep..." tells nobody anything. The text shrinks with the
+          // place rather than being clipped by it.
+          const idSize = clamp(Math.round(b.placeW / 5.2), 13, 21);
+          const labelSize = clamp(Math.round(b.placeW / 4.6), 11, 16);
+          ring(ctx, cx, b.y + 84, clamp(b.placeW * 0.24, 16, 27), progress, tint);
+          fillText(ctx, `#${o.id}`, cx, b.y + 84, idSize, '#3d2f26', 'center', 800);
+          ctx.font = `600 ${labelSize}px system-ui, sans-serif`;
+          fillText(ctx, ellipsis(ctx, text, b.placeW - 8), cx, b.y + 126, labelSize,
+                   switching ? '#d99a1f' : '#8a7461', 'center', 600);
+          ctx.fillStyle = o.colour;
+          roundRect(ctx, cx - 24, b.y + 140, 48, 6, 3); ctx.fill();
+          V.lastPos.set(core.o, { x: px, y: b.y + 50, w: b.placeW, h: 110 });
+        } else {
+          ctx.font = '600 15px system-ui, sans-serif';
+          const bw = clamp(74 + ctx.measureText(text).width, 150, 300), bh = 32;
+          const bx = clamp(p.x - bw / 2, 6, g.w - bw - 6);
+          const by = clamp(y - 96, g.floorTop + 4, g.floorBottom - bh - 4);
+          ctx.fillStyle = 'rgba(255,253,247,.96)'; roundRect(ctx, bx, by, bw, bh, 8); ctx.fill();
+          ctx.strokeStyle = tint; ctx.lineWidth = 2; roundRect(ctx, bx, by, bw, bh, 8); ctx.stroke();
+          fillText(ctx, `#${o.id}`, bx + 12, by + bh / 2, 16, '#3d2f26', 'left', 700);
+          fillText(ctx, ellipsis(ctx, text, bw - 94), bx + 54, by + bh / 2, 15, '#8a7461', 'left', 600);
+          ring(ctx, bx + bw - 18, by + bh / 2, 11, progress, tint);
+          V.lastPos.set(core.o, { x: bx, y: by, w: bw, h: bh });
+        }
+      }
+    } else if (core.s === 'idle') {
+      fillText(ctx, 'idle', p.x, y - 78, 15, '#9c8878', 'center', 600);
+    }
+
+    V.hits.push({
+      x: p.x - 40, y: y - 74, w: 80, h: 130,
+      id: core.o == null ? null : core.o, core: c,
+      tip: cookTip(idx, view, c, want[c], carrying, atLarder, wantedItem),
+    });
+  }
+}
+
+/** A counter: what it is, who needs it, and how hard it has been worked. */
+function stationTip(idx, spec, held, counted, full) {
+  const rows = [];
+  if (counted) {
+    rows.push(['places', `${held} of ${spec.capacity} taken`]);
+    rows.push(['right now', full
+      ? 'full - nothing that needs it can be started'
+      : `${spec.capacity - held} free`]);
+    rows.push(['what it is', `a lock with ${spec.capacity} permit${spec.capacity === 1 ? '' : 's'}: a cook holds one for the whole step`]);
+  } else {
+    rows.push(['places', 'this run had no station limits']);
+  }
+
+  // When it is used: which steps of which recipes come here at all.
+  const labels = stationUsers(idx).get(spec.name);
+  if (labels && labels.size) {
+    const parts = [];
+    for (const [label, recipes] of labels) {
+      parts.push(`<b>${escapeHtml(label)}</b> <span style="opacity:.7">(${escapeHtml(recipes.join(', '))})</span>`);
+    }
+    rows.push(['used for', parts.join('<br>')]);
+    const recipes = new Set();
+    for (const list of labels.values()) for (const r of list) recipes.add(r);
+    const total = (idx.recipes || []).length;
+    rows.push(['on the menu', `${recipes.size} of ${total} recipes come here`]);
+  } else if (counted) {
+    rows.push(['used for', 'nothing on this menu - no step names it']);
+  }
+
+  // And how much of the run it has actually been busy.
+  const usage = stationUsage(idx)[spec.index];
+  if (usage && usage.frames) {
+    rows.push(['over the service', `in use ${(usage.inUse * 100).toFixed(0)}% of ticks · `
+      + `full ${(usage.full * 100).toFixed(0)}% · ${(usage.utilisation * 100).toFixed(0)}% of its places filled`]);
+  }
+  return {
+    key: `st:${spec.name}:${held}:${counted ? 1 : 0}`,
+    title: spec.label,
+    colour: full ? '#c4443c' : '#2f9a68',
+    rows,
+    footer: usage && usage.full > 0.5
+      ? 'This is the station the kitchen runs at. Keeping it fed is worth more than any other single decision.'
+      : null,
+  };
+}
+
+/** What a cook is doing, in the words the model uses for it. */
+function cookTip(idx, view, c, where, carrying, fetching, picked) {
+  const core = view.cores[c];
+  const rows = [];
+  const o = core.o == null ? null : idx.byId.get(core.o);
+  const live = core.o == null ? null : view.orders.get(core.o);
+  let doing;
+  if (carrying) doing = 'carrying the dish to the oven';
+  else if (fetching) {
+    const name = picked ? (INGREDIENT_NAMES[picked] || picked.replace(/-/g, ' ')) : null;
+    doing = name ? `at the larder, collecting ${name}` : 'at the larder, collecting what the next step needs';
+  }
+  else if (core.s === 'switching') doing = `switching · ${Math.ceil(core.r)} tick${Math.ceil(core.r) === 1 ? '' : 's'} of the context switch left`;
+  else if (core.s === 'working') doing = `working at the ${STATION_NAMES[where] || where}`;
+  else doing = 'idle - the scheduler has given it nothing';
+  rows.push(['doing', doing]);
+  if (o && live) {
+    rows.push(['order', `#${o.id} ${o.recipe}`]);
+    rows.push(['step', `${live.label} (${live.step + 1} of ${o.steps.length}) · ${Math.ceil(live.rem)} of ${live.duration} ticks left`]);
+    if (live.station || where) rows.push(['station', STATION_NAMES[where] || where]);
+    rows.push(['customer', `${Math.max(0, o.deadline - Math.floor(V.time))} ticks before they walk out`]);
+  }
+  if (core.s === 'idle') rows.push(['note', 'an idle cook is capacity nobody gets back']);
+  return { title: `cook ${c}`, colour: COOK_COLOURS[c % COOK_COLOURS.length], rows };
+}
+
+/** Everything the run knows about one order. */
+function orderTip(idx, view, id) {
+  const o = idx.byId.get(id);
+  if (!o) return null;
+  const live = view.orders.get(id);
+  const now = Math.floor(V.time);
+  const rows = [];
+  const state = live ? live.st : (o.servedAt != null ? 'served' : o.abandonedAt != null ? 'walked out' : 'not here');
+  rows.push(['state', state === 'blocked' ? 'blocked - waiting on the oven or grill, holding no cook' : state]);
+  if (live) {
+    rows.push(['step', `${live.label} (${live.step + 1} of ${o.steps.length}) · ${Math.ceil(live.rem)} of ${live.duration} ticks left`]);
+    const station = stationOf(idx, id, live);
+    rows.push(['needs', live.kind === 'wait' ? `the ${station}, and no cook` : `a cook at the ${STATION_NAMES[station] || station}`]);
+  }
+  rows.push(['priority', `${o.priority} (${['', 'regular', 'hurried', 'VIP'][o.priority] || 'regular'})`]);
+  rows.push(['arrived', `tick ${o.arrival}`]);
+  rows.push(['walks out at', `tick ${o.deadline} · ${Math.max(0, o.deadline - now)} ticks left of ${o.patience}`]);
+  rows.push(['work', `${o.totalWork} ticks in total`]);
+  rows.push(['waited', `${waitedAt(idx, o, now)} ticks on the rail`]);
+  rows.push(['dispatched', `${upperBound(o.dispatches, now)} time(s) · preempted ${upperBound(o.preemptions, now)}`]);
+  rows.push(['recipe', o.steps.map((s) => s.label + (s.kind === 'wait' ? '*' : '')).join(' → ') + '   (* = no cook)']);
+  return { title: `#${o.id} ${o.recipe}`, colour: o.base, rows };
+}
+
+/** What a cook's hands do at each station. */
+const ACTION_OF = { board: 'chop', hob: 'pan', pass: 'plate', bar: 'pull' };
+
+/** A chef, drawn with primitives: jacket in the cook's colour, white hat. */
+function drawCook(ctx, x, y, colour, s) {
+  const t = s.now;
+  ctx.save();
+  // Everything below is drawn at the size it was designed at and scaled about
+  // the cook's own feet, so one number changes how big every cook is.
+  ctx.translate(x, y); ctx.scale(s.scale || 1, s.scale || 1); ctx.translate(-x, -y);
+  // Legs.
+  ctx.strokeStyle = '#4a3728'; ctx.lineWidth = 5; ctx.lineCap = 'round';
+  const swing = s.walking ? Math.sin(t / 80) * 7 : 0;
+  ctx.beginPath(); ctx.moveTo(x - 6, y + 14); ctx.lineTo(x - 6 + swing, y + 28); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x + 6, y + 14); ctx.lineTo(x + 6 - swing, y + 28); ctx.stroke();
+  // Jacket.
+  ctx.fillStyle = colour; roundRect(ctx, x - 14, y - 8, 28, 26, 7); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.fillRect(x - 1, y - 6, 2, 20);
+  // Arms. The near arm does the work; both swing on the walk.
+  ctx.strokeStyle = colour; ctx.lineWidth = 5;
+  const beat = Math.max(0, Math.sin(t / 90));
+  const chop = s.action === 'chop' ? beat * 10 : 0;
+  ctx.beginPath(); ctx.moveTo(x - 12, y); ctx.lineTo(x - 20 + (s.walking ? swing : 0), y + 12 - chop); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x + 12, y); ctx.lineTo(x + 20 - (s.walking ? swing : 0), y + 12 - chop * 0.4); ctx.stroke();
+
+  const dish = s.held ? s.held.colour : '#e0c8a4';
+  if (s.carrying) {
+    // A tray held out in front, on the way to the oven or the grill.
+    if (drawSprite(ctx, 'oven-tray', x + 24, y + 4, 17)) {
+      ctx.fillStyle = typeof s.carrying === 'string' ? s.carrying : dish;
+      ctx.beginPath(); ctx.ellipse(x + 24, y + 1, 6, 3, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+      return drawCookHead(ctx, x, y, s);
+    }
+    ctx.fillStyle = '#59493f'; roundRect(ctx, x + 12, y + 2, 26, 7, 2); ctx.fill();
+    ctx.fillStyle = typeof s.carrying === 'string' ? s.carrying : dish;
+    ctx.beginPath(); ctx.ellipse(x + 25, y + 1, 9, 4, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(120,90,60,.32)'; ctx.lineWidth = 1.5;
+    for (let k = 0; k < 2; k++) {
+      const ph = (t / 500 + k * 0.5) % 1;
+      ctx.globalAlpha = 1 - ph;
+      ctx.beginPath(); ctx.moveTo(x + 21 + k * 8, y - 4 - ph * 10); ctx.lineTo(x + 21 + k * 8, y - 10 - ph * 10); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  } else if (s.fetching) {
+    // Whatever it just took off the shelf, in its hands.
+    const picked = s.picked || (s.held ? spriteForRecipe(s.held.recipe) : 'wooden-crate');
+    if (!drawSprite(ctx, picked, x + 24, y + 4, 16)) {
+      ctx.fillStyle = '#59493f'; roundRect(ctx, x + 13, y - 2, 22, 15, 3); ctx.fill();
+      ctx.fillStyle = dish; roundRect(ctx, x + 17, y + 1, 14, 6, 2); ctx.fill();
+    }
+  } else if (s.action === 'chop') {
+    // Knife, and a couple of chips flying off the board.
+    ctx.strokeStyle = '#8a94a3'; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(x - 20, y + 12 - chop); ctx.lineTo(x - 28, y + 20 - chop); ctx.stroke();
+    ctx.fillStyle = dish;
+    for (let k = 0; k < 2; k++) { const ph = (t / 300 + k * 0.5) % 1; ctx.globalAlpha = 1 - ph; ctx.fillRect(x - 26 - k * 4, y + 24 - ph * 14, 3, 3); }
+    ctx.globalAlpha = 1;
+  } else if (s.action === 'pan') {
+    // A pan being tossed: the food leaves it on the up-beat.
+    const tilt = Math.sin(t / 150) * 0.4;
+    ctx.save();
+    ctx.translate(x + 24, y + 10); ctx.rotate(tilt);
+    ctx.fillStyle = '#59493f'; ctx.beginPath(); ctx.ellipse(0, 0, 13, 5, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#59493f'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(-13, 0); ctx.lineTo(-24, -1); ctx.stroke();
+    ctx.fillStyle = dish; ctx.beginPath(); ctx.ellipse(0, -2, 7, 3, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    ctx.fillStyle = dish; ctx.globalAlpha = beat;
+    ctx.beginPath(); ctx.arc(x + 24, y + 2 - beat * 12, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+  } else if (s.action === 'plate') {
+    // A plate held out flat, steaming.
+    ctx.fillStyle = '#fbf7f0'; ctx.beginPath(); ctx.ellipse(x + 25, y + 11, 14, 5, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = dish; ctx.beginPath(); ctx.ellipse(x + 25, y + 9, 8, 3.5, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(120,90,60,.34)'; ctx.lineWidth = 1.5;
+    for (let k = 0; k < 2; k++) {
+      const ph = (t / 700 + k * 0.5) % 1;
+      ctx.globalAlpha = 1 - ph;
+      ctx.beginPath(); ctx.moveTo(x + 21 + k * 8, y + 4 - ph * 12); ctx.quadraticCurveTo(x + 25 + k * 8, y - ph * 12, x + 21 + k * 8, y - 4 - ph * 12); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  } else if (s.action === 'pull') {
+    // A cup under the group head.
+    ctx.fillStyle = '#fbf7f0'; roundRect(ctx, x + 18, y + 4, 12, 10, 3); ctx.fill();
+    ctx.fillStyle = dish; ctx.fillRect(x + 20, y + 6, 8, 3);
+    ctx.strokeStyle = 'rgba(120,90,60,.32)'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(x + 32, y + 9, 4, -Math.PI / 2, Math.PI / 2); ctx.stroke();
+  }
+  ctx.restore();
+  drawCookHead(ctx, x, y, s);
+}
+
+/** The head and the hat, on top of whatever the hands ended up doing. */
+function drawCookHead(ctx, x, y, s) {
+  ctx.save();
+  ctx.translate(x, y); ctx.scale(s.scale || 1, s.scale || 1); ctx.translate(-x, -y);
+  ctx.fillStyle = '#e8b892'; ctx.beginPath(); ctx.arc(x, y - 16, 9, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#3d2f26';
+  const gaze = s.walking ? (s.dir >= 0 ? 1.5 : -1.5) : 0;
+  ctx.fillRect(x - 4 + gaze, y - 17, 2, 2); ctx.fillRect(x + 2 + gaze, y - 17, 2, 2);
+  ctx.fillStyle = '#fffdf8'; roundRect(ctx, x - 9, y - 26, 18, 6, 2); ctx.fill();
+  roundRect(ctx, x - 8, y - 36, 16, 12, 6); ctx.fill();
+  // A warm outline: a white hat has no shape at all against a cream floor.
+  ctx.strokeStyle = 'rgba(120,90,60,.42)'; ctx.lineWidth = 1;
+  roundRect(ctx, x - 9, y - 26, 18, 6, 2); ctx.stroke();
+  roundRect(ctx, x - 8, y - 36, 16, 12, 6); ctx.stroke();
+  ctx.restore();
+}
+
+/** Served / abandoned / unblocked slides, from where the card last was. */
+function drawFx(ctx, g, now) {
+  const idx = V.index;
+  V.fx = V.fx.filter((f) => now - f.start < f.dur);
+  for (const f of V.fx) {
+    const p = clamp((now - f.start) / f.dur, 0, 1);
+    const o = idx.byId.get(f.id);
+    const from = f.from || { x: g.w / 2, y: g.floorTop + 60, w: 108, h: 42 };
+    let to;
+    if (f.kind === 'served') to = V.hatch || { x: 60, y: g.floorTop + 60 };
+    else if (f.kind === 'abandoned') to = V.door || { x: 60, y: g.floorBottom - 60 };
+    else to = { x: g.floorLeft + 80, y: g.railTop + 60 };
+    const ease = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+    const x = lerp(from.x, to.x - 54, ease), y = lerp(from.y, to.y - 21, ease);
+    ctx.globalAlpha = 1 - Math.max(0, p - 0.7) / 0.3;
+    ctx.fillStyle = '#fffdf7'; roundRect(ctx, x, y, 108, 42, 9); ctx.fill();
+    if (o) {
+      ctx.fillStyle = o.colour; ctx.fillRect(x, y, 108, 6);
+      fillText(ctx, `${o.recipe} #${o.id}`, x + 54, y + 26, 15, '#3d2f26', 'center', 600);
+    }
+    if (f.kind === 'served') fillText(ctx, '+1', to.x + 58, to.y - 14 - p * 34, 26, '#2f8055', 'center', 800);
+    if (f.kind === 'abandoned') fillText(ctx, '☹ left!', to.x + 64, to.y - 14 - p * 30, 20, '#c4443c', 'center', 800);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ---- the Gantt timeline -------------------------------------------------------
+
+/** The window of ticks the timeline shows. */
+const GANTT_TOP = 54, GANTT_ROW_H = 40, GANTT_ROW_MAX = 54, GANTT_LANE_H = 60, GANTT_LANE_MAX = 130, GANTT_GUTTER = 64, GANTT_PAD_R = 24;
+
+/** How many orders were sitting on the rail at each recorded frame, and the
+ *  worst of them. Computed once per replay; `stateAt` caches the frames. */
+function ganttDepth() {
+  const idx = V.index;
+  if (idx.depthCache) return idx.depthCache;
+  const ready = new Int32Array(idx.frames.length);
+  let max = 1;
+  for (let i = 0; i < idx.frames.length; i++) {
+    ready[i] = stateAt(idx, i).ready.length;
+    if (ready[i] > max) max = ready[i];
+  }
+  idx.depthCache = { ready, max };
+  return idx.depthCache;
+}
+
+/** How much width the timeline gives each tick.
+ *
+ * The control is in ticks-in-view rather than pixels-per-tick, because "show
+ * me 250 ticks" is the question people have and "give each tick 4 pixels" is
+ * only ever the answer to it. On a narrow window a tick gets fewer pixels for
+ * the same setting, which is the right way round: the window decides how much
+ * detail fits, the setting decides how much time. */
+function ganttPxPerTick() {
+  if (!V.index) return 1;
+  const inner = Math.max(60, V.gantt.w - GANTT_GUTTER - GANTT_PAD_R);
+  const ticks = V.zoom === 'fit' ? Math.max(1, V.index.maxTicks) : Math.max(1, V.zoom);
+  return inner / ticks;
+}
+
+function ganttContentWidth() {
+  if (!V.index) return 0;
+  return GANTT_GUTTER + Math.max(1, V.index.maxTicks) * ganttPxPerTick() + GANTT_PAD_R;
+}
+
+/** Gives the scroll track the width the whole run needs, so the bar is honest. */
+function syncGanttTrack() {
+  if (!el.ganttTrack || !V.index) return;
+  el.ganttTrack.style.width = `${Math.max(V.gantt.w, Math.round(ganttContentWidth()))}px`;
+}
+
+/** Keeps the playhead on screen. Nudges only when it drifts out of the middle
+ *  band, so the timeline is not sliding under the pointer the whole run. */
+function followPlayhead(force) {
+  if (!V.index || !el.ganttScroll) return;
+  if (!force && !V.follow) return;
+  const port = el.ganttScroll;
+  const max = Math.max(0, port.scrollWidth - port.clientWidth);
+  if (max <= 0) return;
+  const inner = Math.max(60, V.gantt.w - GANTT_GUTTER);
+  const at = V.time * ganttPxPerTick() - port.scrollLeft;
+  if (!force && at >= inner * 0.10 && at <= inner * 0.80) return;
+  port.scrollLeft = clamp(V.time * ganttPxPerTick() - inner * 0.35, 0, max);
+}
+
+function drawGantt() {
+  const ctx = V.gantt.ctx;
+  if (!ctx || !V.index) return;
+  const idx = V.index;
+  const { w, h } = V.gantt;
+  const ppt = ganttPxPerTick();
+  const scroll = el.ganttScroll ? el.ganttScroll.scrollLeft : 0;
+  const top = GANTT_TOP;
+  const rowH = clamp(Math.floor((h - top - 34) / idx.cores), 22, GANTT_ROW_MAX);
+  const bottom = top + idx.cores * rowH;
+  // Whatever height is left over goes to the rail-depth lane rather than to
+  // whitespace; on a short window there is none and the lane simply is not there.
+  const laneTop = bottom + 12;
+  const laneH = Math.min(GANTT_LANE_MAX, Math.max(0, h - 22 - laneTop));
+  const lane = laneH >= 30;
+  const foot = lane ? laneTop + laneH : bottom;
+  const sx = (t) => GANTT_GUTTER + t * ppt - scroll;
+  const t0 = Math.max(0, scroll / ppt);
+  const t1 = Math.min(idx.maxTicks, (scroll + w - GANTT_GUTTER) / ppt);
+
+  ctx.clearRect(0, 0, w, h);
+
+  // Everything time-related is clipped to the right of the label gutter, so the
+  // gutter and the header stay legible however far the run is scrolled.
+  ctx.save();
+  ctx.beginPath(); ctx.rect(GANTT_GUTTER, top - 30, w - GANTT_GUTTER, h - top + 30); ctx.clip();
+
+  // Axis: gridlines at a round spacing that stays about 80px apart.
+  const nice = [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000, 10000, 25000];
+  const step = nice.find((s) => s * ppt >= 90) || nice[nice.length - 1];
+  ctx.strokeStyle = 'rgba(120,90,60,.14)'; ctx.lineWidth = 1;
+  for (let t = Math.ceil(t0 / step) * step; t <= t1; t += step) {
+    const x = sx(t);
+    ctx.beginPath(); ctx.moveTo(x, top - 4); ctx.lineTo(x, foot); ctx.stroke();
+    fillText(ctx, String(t), x, foot + 13, 10, '#8a7461', x < GANTT_GUTTER + 10 ? 'left' : 'center', 500);
+  }
+
+  // One row per cook: solid where they worked, hatched where they were switching.
+  for (let c = 0; c < idx.cores; c++) {
+    const y = top + c * rowH;
+    ctx.fillStyle = 'rgba(120,90,60,.06)'; ctx.fillRect(GANTT_GUTTER, y + 3, w - GANTT_GUTTER, rowH - 6);
+    for (const seg of idx.gantt[c]) {
+      if (seg.to <= t0 || seg.from >= t1 || seg.s === 'idle' || seg.o == null) continue;
+      const o = idx.byId.get(seg.o);
+      const x0 = sx(Math.max(seg.from, t0)), x1 = sx(Math.min(seg.to, t1));
+      const wseg = Math.max(1, x1 - x0);
+      ctx.fillStyle = o ? o.colour : '#8a7461';
+      if (seg.s === 'switching') {
+        ctx.globalAlpha = 0.45; ctx.fillRect(x0, y + 3, wseg, rowH - 6); ctx.globalAlpha = 1;
+        hatch(ctx, x0, y + 3, wseg, rowH - 6, 'rgba(0,0,0,.45)');
+      } else {
+        ctx.fillRect(x0, y + 3, wseg, rowH - 6);
+      }
+      if (!o || wseg < 26) continue;
+      const twoLine = wseg > 64 && rowH >= 26;
+      ctx.font = '700 12px system-ui, sans-serif';
+      fillText(ctx, ellipsis(ctx, `#${o.id}`, wseg - 6), x0 + 5, y + (twoLine ? rowH / 2 - 6 : rowH / 2), 12, o.text, 'left', 700);
+      if (twoLine) {
+        ctx.font = '500 10px system-ui, sans-serif';
+        fillText(ctx, ellipsis(ctx, `${o.recipe} · ${seg.s === 'switching' ? 'switching' : 'working'}`, wseg - 6), x0 + 5, y + rowH / 2 + 8, 10, o.text, 'left', 500);
+      }
+    }
+  }
+
+  // The rail depth: how long the ready queue was, over the same window. This is
+  // the queue the scheduler is choosing from, so it is the shape of the problem.
+  if (lane) {
+    const d = ganttDepth();
+    const ly = laneTop, lh = laneH - 4;
+    ctx.fillStyle = 'rgba(120,90,60,.05)'; ctx.fillRect(GANTT_GUTTER, ly, w - GANTT_GUTTER, lh);
+    const i0 = Math.max(0, frameIndexAt(idx, Math.floor(t0)) - 1);
+    const i1 = Math.min(idx.frames.length - 1, frameIndexAt(idx, Math.ceil(t1)) + 1);
+    const yv = (i) => ly + lh - (d.ready[i] / d.max) * (lh - 4);
+    ctx.beginPath();
+    ctx.moveTo(sx(idx.frames[i0].t), ly + lh);
+    for (let i = i0; i <= i1; i++) {
+      ctx.lineTo(sx(idx.frames[i].t), yv(i));
+      if (i < i1) ctx.lineTo(sx(idx.frames[i + 1].t), yv(i));
+    }
+    ctx.lineTo(sx(idx.frames[i1].t), ly + lh);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(212,99,140,.26)'; ctx.fill();
+    ctx.beginPath();
+    for (let i = i0; i <= i1; i++) {
+      const x = sx(idx.frames[i].t);
+      if (i === i0) ctx.moveTo(x, yv(i)); else ctx.lineTo(x, yv(i));
+      if (i < i1) ctx.lineTo(sx(idx.frames[i + 1].t), yv(i));
+    }
+    ctx.strokeStyle = 'rgba(212,99,140,.8)'; ctx.lineWidth = 1.5; ctx.stroke();
+    fillText(ctx, `peak ${d.max}`, GANTT_GUTTER + 8, ly + 10, 10, 'rgba(212,99,140,.75)', 'left', 600);
+  }
+
+  // Markers above the rows: arrivals and walk-outs, drawn big enough to read
+  // at a glance - a walk-out is the thing you most want to spot in a run.
+  const my = top - 16;
+  for (const o of idx.orders) {
+    if (o.arrival >= t0 && o.arrival <= t1) {
+      const x = sx(o.arrival);
+      ctx.fillStyle = 'rgba(138,116,97,.95)';
+      ctx.beginPath(); ctx.moveTo(x, my - 8); ctx.lineTo(x - 7, my + 6); ctx.lineTo(x + 7, my + 6); ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,253,247,.9)'; ctx.lineWidth = 1; ctx.stroke();
+    }
+    if (o.abandonedAt != null && o.abandonedAt >= t0 && o.abandonedAt <= t1) {
+      const x = sx(o.abandonedAt);
+      ctx.strokeStyle = '#c4443c'; ctx.lineWidth = 3.5; ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(x - 7, my - 7); ctx.lineTo(x + 7, my + 7);
+      ctx.moveTo(x + 7, my - 7); ctx.lineTo(x - 7, my + 7);
+      ctx.stroke();
+    }
+  }
+
+  // Playhead.
+  const px = sx(clamp(V.time, t0, t1));
+  ctx.strokeStyle = '#e0714b'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(px, top - 30); ctx.lineTo(px, foot + 4); ctx.stroke();
+  const bx = clamp(px, GANTT_GUTTER + 24, w - 24);
+  ctx.fillStyle = '#e0714b'; roundRect(ctx, bx - 23, top - 30, 46, 14, 4); ctx.fill();
+  fillText(ctx, String(Math.floor(V.time)), bx, top - 23, 11, '#fff7ec', 'center', 800);
+  ctx.restore();
+
+  // The header band and the pinned label gutter, painted over the top.
+  ctx.fillStyle = '#f7e8d1'; ctx.fillRect(0, 0, w, top - 30);
+  fillText(ctx, 'TIMELINE', 10, 13, 11, '#8a7461', 'left', 700);
+  fillText(ctx, `solid = working · hatched = switching · ▲ arrival · ✕ walked out${lane ? ' · pink = orders waiting on the rail' : ''}`, GANTT_GUTTER + 16, 13, 10, '#9c8878', 'left', 500);
+  fillText(ctx, `${Math.round(t0)}–${Math.round(t1)} of ${idx.maxTicks}`, w - 10, 13, 10, '#8a7461', 'right', 600);
+
+  V.ganttMap = { top, rowH, bottom, ppt, t0, t1 };
+  ctx.fillStyle = '#f7e8d1'; ctx.fillRect(0, top - 30, GANTT_GUTTER, h - top + 30);
+  ctx.strokeStyle = 'rgba(120,90,60,.18)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(GANTT_GUTTER + .5, top - 30); ctx.lineTo(GANTT_GUTTER + .5, foot + 4); ctx.stroke();
+  if (lane) fillText(ctx, 'on the rail', GANTT_GUTTER - 8, laneTop + laneH / 2, 11, 'rgba(212,99,140,.9)', 'right', 700);
+  for (let c = 0; c < idx.cores; c++) {
+    const y = top + c * rowH;
+    ctx.fillStyle = COOK_COLOURS[c % COOK_COLOURS.length];
+    roundRect(ctx, 8, y + rowH / 2 - 4, 8, 8, 2); ctx.fill();
+    fillText(ctx, `cook ${c}`, GANTT_GUTTER - 8, y + rowH / 2, 11, COOK_COLOURS[c % COOK_COLOURS.length], 'right', 700);
+  }
+}
+
+function ganttTimeAt(clientX) {
+  const rect = V.gantt.canvas.getBoundingClientRect();
+  const scroll = el.ganttScroll ? el.ganttScroll.scrollLeft : 0;
+  const x = clientX - rect.left - GANTT_GUTTER + scroll;
+  return clamp(x / ganttPxPerTick(), 0, V.index ? V.index.maxTicks : 0);
+}
+
+// ---- the tooltip ------------------------------------------------------------
+
+/** Shows `tip` next to the pointer. `tip` is `{title, colour, rows, footer}`. */
+function showTip(clientX, clientY, tip) {
+  if (!tip) { hideTip(); return; }
+  if (V.tipKey === tip.key && !el.tip.hidden) { placeTip(clientX, clientY); return; }
+  V.tipKey = tip.key;
+  const rows = (tip.rows || [])
+    .map(([k, v]) => `<tr><td class="k">${escapeHtml(k)}</td><td class="v">${v}</td></tr>`)
+    .join('');
+  el.tip.innerHTML =
+    `<div class="t" style="color:${tip.colour || '#4a3728'}">${escapeHtml(tip.title || '')}</div>`
+    + (rows ? `<table>${rows}</table>` : '')
+    + (tip.footer ? `<div class="f">${tip.footer}</div>` : '');
+  el.tip.style.borderLeftColor = tip.colour || 'var(--accent)';
+  el.tip.hidden = false;
+  placeTip(clientX, clientY);
+}
+
+/** Keeps the tooltip on screen: it flips rather than being clipped. */
+function placeTip(clientX, clientY) {
+  const box = el.tip.getBoundingClientRect();
+  const pad = 14;
+  let x = clientX + pad, y = clientY + pad;
+  if (x + box.width > window.innerWidth - 8) x = clientX - box.width - pad;
+  if (y + box.height > window.innerHeight - 8) y = clientY - box.height - pad;
+  el.tip.style.left = `${Math.max(8, x)}px`;
+  el.tip.style.top = `${Math.max(8, y)}px`;
+}
+
+function hideTip() {
+  el.tip.hidden = true;
+  V.tipKey = null;
+}
+
+/** The topmost thing drawn under a point on the kitchen canvas. */
+function hitAt(x, y) {
+  for (let k = V.hits.length - 1; k >= 0; k--) {
+    const h = V.hits[k];
+    if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) return h;
+  }
+  return null;
+}
+
+/** The timeline segment under a point, with the row it is on. */
+function ganttHitAt(clientX, clientY) {
+  const idx = V.index;
+  if (!idx || !V.ganttMap) return null;
+  const rect = V.gantt.canvas.getBoundingClientRect();
+  const x = clientX - rect.left, y = clientY - rect.top;
+  const m = V.ganttMap;
+  if (x < GANTT_GUTTER) return null;
+  const row = Math.floor((y - m.top) / m.rowH);
+  if (row < 0 || row >= idx.cores) return null;
+  const t = ganttTimeAt(clientX);
+  for (const seg of idx.gantt[row]) {
+    if (t >= seg.from && t < seg.to) return { core: row, seg };
+  }
+  return null;
+}
+
+/** What one block on a cook's row was. */
+function segmentTip(core, seg) {
+  const idx = V.index;
+  const o = seg.o == null ? null : idx.byId.get(seg.o);
+  const span = Math.max(1, seg.to - seg.from);
+  const colour = COOK_COLOURS[core % COOK_COLOURS.length];
+  if (seg.s === 'idle' || !o) {
+    return {
+      key: `g${core}:${seg.from}`,
+      title: `cook ${core} · idle`,
+      colour,
+      rows: [['ticks', `${seg.from} to ${seg.to} (${span})`]],
+      footer: 'A cook with nothing on it. Every one of these ticks is capacity the kitchen never gets back.',
+    };
+  }
+  const label = stepLabelAt(idx, seg.o, seg.from) || '';
+  const station = idx.contended ? stationAtTick(idx, seg.o, seg.from) : null;
+  const rows = [
+    ['what', seg.s === 'switching'
+      ? 'paying the context switch - no work happens in these ticks'
+      : `working: <b>${escapeHtml(label)}</b>`],
+    ['order', `#${o.id} ${escapeHtml(o.recipe)}`],
+    ['ticks', `${seg.from} to ${seg.to} (${span})`],
+  ];
+  if (station) rows.push(['station', escapeHtml(STATION_NAMES[station] || station)]);
+  rows.push(['order needs', `${o.totalWork} ticks of work in all`]);
+  rows.push(['customer', `arrived ${o.arrival}, walks out at ${o.deadline}`]);
+  return {
+    key: `g${core}:${seg.from}:${seg.s}`,
+    title: `cook ${core} · ticks ${seg.from}–${seg.to}`,
+    colour: o.colour,
+    rows,
+    footer: seg.s === 'switching'
+      ? 'Hatched blocks are switches. A scheduler that changes its mind often spends the kitchen on these.'
+      : null,
+  };
+}
+
+/** The station an order's step was at on a given tick, from the frames. */
+function stationAtTick(idx, id, tick) {
+  const o = idx.byId.get(id);
+  if (!o) return null;
+  const of = stateAt(idx, frameIndexAt(idx, tick)).live.get(id);
+  const step = of ? o.steps[of.step] : null;
+  if (!step || step.station == null) return null;
+  const station = idx.stations[step.station];
+  return station ? station.name : null;
+}
+
+// ---- the loop ---------------------------------------------------------------------
+
+function loop(now) {
+  if (!V.index) return;
+  const dt = V.lastNow ? Math.min(100, now - V.lastNow) : 0;
+  V.lastNow = now;
+  if (V.playing) {
+    setTime(V.time + dt * (V.speed / V.index.tickMs));
+    if (V.time >= V.index.lastTick) {
+      pause();
+      if (V.endShownFor !== V.index.lastTick) { V.endShownFor = V.index.lastTick; showOverlay(); }
+    }
+  }
+  if (V.playing) followPlayhead(false);
+  const tick = Math.floor(V.time);
+  syncEvents(tick);
+  refreshPanels(tick, false);
+  if (now > V.noticeUntil) el.notice.classList.remove('show');
+  drawKitchen(now);
+  drawGantt();
+  requestAnimationFrame(loop);
+}
+
+// ---- wiring -------------------------------------------------------------------------
+
+function boot() {
+  const ids = {
+    message: 'message', sbPolicy: 'sb-policy', sbProfile: 'sb-profile', sbSeed: 'sb-seed', sbTick: 'sb-tick',
+    sbClock: 'sb-clock', sbServed: 'sb-served', sbAbandoned: 'sb-abandoned', sbLive: 'sb-live',
+    sbSwitches: 'sb-switches', sbUtil: 'sb-util', notice: 'notice', kitchenWrap: 'kitchen-wrap',
+    ganttWrap: 'gantt-wrap', ganttScroll: 'gantt-scroll', ganttTrack: 'gantt-track', dbgText: 'dbg-text', dbgExtra: 'dbg-extra', log: 'log',
+    inspectorBody: 'inspector-body', resultsBody: 'results-body', btnRestart: 'btn-restart',
+    btnBack: 'btn-back', btnPlay: 'btn-play', btnFwd: 'btn-fwd', speed: 'speed', scrub: 'scrub',
+    pos: 'pos', zoom: 'zoom', follow: 'follow', btnResults: 'btn-results', overlay: 'overlay',
+    app: 'app', scoreboard: 'scoreboard', controls: 'controls',
+    ovBody: 'ov-body', ovClose: 'ov-close', tip: 'tip',
+  };
+  for (const k of Object.keys(ids)) el[k] = $(ids[k]);
+  V.kitchen.canvas = $('kitchen');
+  V.gantt.canvas = $('gantt');
+
+  el.btnPlay.addEventListener('click', togglePlay);
+  el.btnRestart.addEventListener('click', restart);
+  el.btnBack.addEventListener('click', () => stepFrame(-1));
+  el.btnFwd.addEventListener('click', () => stepFrame(1));
+  el.btnResults.addEventListener('click', showOverlay);
+  el.ovClose.addEventListener('click', hideOverlay);
+  el.overlay.addEventListener('click', (e) => { if (e.target === el.overlay) hideOverlay(); });
+  el.speed.addEventListener('change', () => { V.speed = parseFloat(el.speed.value) || 1; });
+  el.zoom.addEventListener('change', () => {
+    V.zoom = el.zoom.value === 'fit' ? 'fit' : (parseFloat(el.zoom.value) || 250);
+    resizeGantt();
+    followPlayhead(true);
+  });
+  el.follow.addEventListener('change', () => { V.follow = el.follow.checked; if (V.follow) followPlayhead(true); });
+  el.scrub.addEventListener('input', () => { pause(); setTime(parseFloat(el.scrub.value) || 0); followPlayhead(true); });
+
+  // A wheel over the timeline pans it, because a horizontal scroller does not
+  // answer a vertical wheel on its own and reaching for the bar every time is
+  // no way to read a run.
+  el.ganttScroll.addEventListener('wheel', (e) => {
+    const port = el.ganttScroll;
+    if (port.scrollWidth <= port.clientWidth) return;
+    const d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+    if (!d) return;
+    e.preventDefault();
+    port.scrollLeft += d;
+  }, { passive: false });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.target && /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName) && e.key !== 'Escape') return;
+    if (!V.index) return;
+    if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); stepFrame(1); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); stepFrame(-1); }
+    else if (e.key === 'Home') { e.preventDefault(); restart(); }
+    else if (e.key === 'Escape') hideOverlay();
+  });
+
+  // Clicking the kitchen inspects whatever is under the pointer.
+  V.kitchen.canvas.addEventListener('click', (e) => {
+    const rect = V.kitchen.canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    let hit = null;
+    for (let k = V.hits.length - 1; k >= 0; k--) {
+      const h = V.hits[k];
+      if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) { hit = h; break; }
+    }
+    selectOrder(hit && hit.id != null ? hit.id : null);
+  });
+
+  // Hovering anything in the kitchen says what it is.
+  V.kitchen.canvas.addEventListener('pointermove', (e) => {
+    const rect = V.kitchen.canvas.getBoundingClientRect();
+    const hit = hitAt(e.clientX - rect.left, e.clientY - rect.top);
+    if (!hit || !hit.tip) { hideTip(); return; }
+    const tip = hit.tip;
+    tip.key = tip.key || `${tip.title}:${hit.core != null ? 'c' + hit.core : 'o' + hit.id}`;
+    showTip(e.clientX, e.clientY, tip);
+  });
+  V.kitchen.canvas.addEventListener('pointerleave', hideTip);
+
+  // And hovering a block on the timeline says what that cook was doing then.
+  V.gantt.canvas.addEventListener('pointermove', (e) => {
+    if (V.drag) { hideTip(); return; }
+    const hit = ganttHitAt(e.clientX, e.clientY);
+    showTip(e.clientX, e.clientY, hit ? segmentTip(hit.core, hit.seg) : null);
+  });
+  V.gantt.canvas.addEventListener('pointerleave', hideTip);
+  el.ganttScroll.addEventListener('scroll', hideTip);
+  window.addEventListener('blur', hideTip);
+
+  // Dragging on the timeline scrubs.
+  const scrubTo = (e) => { setTime(ganttTimeAt(e.clientX)); refreshPanels(Math.floor(V.time), true); };
+  V.gantt.canvas.addEventListener('pointerdown', (e) => {
+    V.drag = { wasPlaying: V.playing }; pause(); scrubTo(e);
+    V.gantt.canvas.setPointerCapture(e.pointerId);
+  });
+  V.gantt.canvas.addEventListener('pointermove', (e) => { if (V.drag) scrubTo(e); });
+  V.gantt.canvas.addEventListener('pointerup', (e) => {
+    if (!V.drag) return;
+    if (V.drag.wasPlaying) play();
+    V.drag = null;
+    try { V.gantt.canvas.releasePointerCapture(e.pointerId); } catch (_) { /* already released */ }
+  });
+
+  const ro = new ResizeObserver(() => {
+    if (!V.index) return;
+    resizeCanvas(V.kitchen, el.kitchenWrap);
+    resizeGantt();
+  });
+  // How much room the panels may have is a function of the window's height, and
+  // a window resized only in height need not resize either canvas wrapper - so
+  // the observer above can miss it.
+  window.addEventListener('resize', () => {
+    if (!V.index) return;
+    layoutHeights();
+    resizeCanvas(V.kitchen, el.kitchenWrap);
+    resizeGantt();
+  });
+  ro.observe(el.kitchenWrap);
+  ro.observe(el.ganttScroll);
+
+  installMetricTips();
+  loadSprites();
+  loadReplay();
+}
+
+if (typeof document !== 'undefined') {
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,148 @@
+# "private function": a booked-out evening, served in sittings.
+#
+# Every other profile is event-dense. Orders arrive every few ticks and dishes
+# come out of the oven, so a scheduler is called six hundred times in a
+# seventeen-hundred-tick service and is never more than a moment away from its
+# next chance to change its mind. On those profiles `wake_in` earns nothing:
+# an event always beats the timer to it. Waking on *every tick* of the course
+# profile moves the score by less than two hundredths of a point.
+#
+# This profile is the opposite, and it exists to make the timer interrupt
+# matter. Five ticks of arrivals, then four hundred of nothing, four times
+# over - and no dish ever goes in an oven, so between sittings the only events
+# left are "a dish is finished" and "a customer left". Start a two-hundred-
+# tick main and the kitchen will not ask you anything for two hundred ticks
+# unless you arrange to be asked.
+#
+# So the choice it puts to a scheduler is the one round robin was invented
+# for. Run each order to completion and the last table is not so much as
+# looked at for most of the sitting. Rotate, and everybody is served something
+# early but everybody finishes late - and every rotation costs a switch. There
+# is no way to rotate at all without `wake_in`.
+#
+# It runs the same 2400 ticks as every other profile, but it cannot hold as
+# many orders: fifteen long dishes over two cooks is 52% of the service, and
+# the same tick budget spent on shorter ones would hand the scheduler an event
+# every few ticks and undo the point. Filling it to fifty orders on four cooks
+# was tried and cut the advantage of a timer from three points to one. So the
+# spread between seeds here is wider than on a profile with two hundred orders
+# in it - closer to +/-1.5 than +/-0.4 over forty seeds - and that is the price
+# of asking this particular question.
+
+[kitchen]
+name = "private function"
+cores = 2
+switch_cost = 2
+# The same 2400-tick service as every other profile, so this one is not an
+# outlier in size and its confidence interval is comparable.
+max_ticks = 2400
+known_durations = true
+seed = 1234
+
+[workload]
+# Sittings, not a stream. The party arrives in five seatings a few hundred
+# ticks apart, and between them nothing arrives at all - which is what keeps
+# the timer interesting. A continuous trickle of the same number of orders
+# would hand the scheduler an event every few ticks and this profile would
+# stop asking its question.
+#
+# The base rate is nil; each sitting is a five-tick window with a multiplier
+# large enough that the rate is several arrivals per tick, and the engine
+# splits a rate above one into that many trials rather than clipping it.
+arrival_window = 1500
+mean_interarrival = 100000.0
+warmup_orders = 5
+max_orders = 15
+
+[[workload.rush]]
+start = 400
+end = 403
+multiplier = 120000.0
+
+[[workload.rush]]
+start = 800
+end = 803
+multiplier = 120000.0
+
+[[workload.rush]]
+start = 1200
+end = 1203
+multiplier = 120000.0
+
+[[workload.rush]]
+start = 1400
+end = 1403
+multiplier = 120000.0
+
+# --- the menu ------------------------------------------------------------------
+#
+# One work step each and no oven, deliberately: an oven step would hand the
+# scheduler a free event every time a dish came out, which is exactly what this
+# profile is built to withhold. The spread of lengths is wide, so shortest-job
+# first has something real to say - it simply has to say it without ever being
+# asked twice.
+
+[[recipe]]
+name = "canape"
+weight = 5.0
+priority = 2
+patience = [700, 900]
+steps = [{ label = "assemble", kind = "work", ticks = [25, 45], station = "board" }]
+
+[[recipe]]
+name = "main"
+weight = 4.0
+priority = 1
+patience = [900, 1300]
+steps = [{ label = "cook", kind = "work", ticks = [170, 240], station = "board" }]
+
+# Few of these, and long. They are what makes the profile bite: start one and
+# that cook says nothing for three hundred ticks, and whoever is waiting is
+# waiting on a scheduler that has not arranged to be asked again.
+[[recipe]]
+name = "centrepiece"
+weight = 2.0
+priority = 1
+patience = [1500, 2000]
+steps = [{ label = "build", kind = "work", ticks = [340, 460], station = "board" }]
+
+[[station]]
+name = "board"
+capacity = 2
+label = "prep bench"
+
+# --- what it is marked on ------------------------------------------------------
+#
+# Its own weights, because it is asking its own question.
+#
+# Under the course weights a rotation is never worth it here: waking to share
+# the cooks around takes response from 343 ticks to 32 - a tenfold improvement,
+# the largest of any behaviour on any profile - and still loses by fifteen
+# points, because rotating costs the whole of the switching component and
+# switching is worth 15. A profile where the answer is "no" whatever you do is
+# not asking anything.
+#
+# So responsiveness is worth more here and switching less. Switching is not
+# free - it should not be, the switches are real - but it no longer decides the
+# question on its own. The scales are lengthened to match a service where the
+# shortest dish is twenty-five ticks and the longest five hundred: a mean
+# response of 25 ticks is not a meaningful half-marks point when nothing can
+# be done in under 25.
+
+[scoring]
+response_scale = 90.0
+turnaround_scale = 400.0
+slowdown_bound = 25.0
+
+# Seven profiles reward getting dishes finished. This one rewards not leaving
+# anybody unlooked-at, which is the other half of the argument and the reason
+# round robin exists at all. A scheduler that wins everywhere else and loses
+# here has learnt one lesson and not the other - which is the point of marking
+# on the mean across profiles rather than on the course profile alone.
+[scoring.weights]
+completion = 0.25
+response = 0.30
+turnaround = 0.075
+slowdown = 0.075
+switching = 0.05
+fairness = 0.25

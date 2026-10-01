@@ -1,0 +1,24 @@
+# "blind service": the course menu, with step durations hidden.
+#
+# This is the position a real scheduler is in. The observation still shows
+# every order's recipe and the shape of its steps, and it reports the true
+# duration of every step that has already finished - plus a history of the
+# last sixty served orders, with their real timings. Shortest-job-first has to
+# become "shortest-*estimated*-job-first", and the estimate is the assignment.
+# Nothing else differs from default.toml.
+
+[kitchen]
+name = "blind service"
+known_durations = false
+
+# Each recipe's timings are stretched or squeezed by a factor drawn once per
+# run, so the menu in default.toml is a prior rather than an answer key. It has
+# to be: this file and that one both ship to students, and "hidden durations"
+# is not hidden if the numbers are a text file away.
+#
+# Within a run a recipe still has a stable length, so estimating it from
+# `obs.history` works exactly as before - it is only a table of copied
+# constants that stops working. A recipe's patience stretches with its steps,
+# so a slower dish gets a proportionally more patient customer and the run does
+# not simply become harder.
+duration_jitter = [0.7, 1.4]

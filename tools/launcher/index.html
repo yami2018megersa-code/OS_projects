@@ -1,0 +1,834 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Short Order Launcher</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='15' fill='%23fdf4e6'/%3E%3Cpath d='M9 13h14v3.4a7 7 0 0 1-14 0z' fill='%23e0714b'/%3E%3Cpath d='M8.6 11.6h14.8v2.2H8.6z' fill='%23fffdf8'/%3E%3Ccircle cx='12' cy='9' r='2.6' fill='%23fffdf8'/%3E%3Ccircle cx='16' cy='7.4' r='3' fill='%23fffdf8'/%3E%3Ccircle cx='20' cy='9' r='2.6' fill='%23fffdf8'/%3E%3Ccircle cx='12.6' cy='19.4' r='1.1' fill='%23fffdf8'/%3E%3Ccircle cx='19.4' cy='19.4' r='1.1' fill='%23fffdf8'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<!-- Rounded display type. Loaded without blocking the first paint - the
+     `media` swap is what does that - because a lab machine with no network
+     must not wait on fonts.googleapis.com to draw the page. The CSS below
+     names a full system fallback stack, so offline it still looks like
+     itself. -->
+<link rel="stylesheet" media="print" onload="this.media='all'"
+      href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;600;700;800&family=Nunito:wght@400;500;600;700;800&display=swap">
+<style>
+  :root {
+    /* --- warm cream cafe -----------------------------------------------------
+       Front of house, not a control room: paper creams, a terracotta accent and
+       food colours. Every hue here is picked to read as text on cream, so the
+       "ink" variants are the ones to reach for with small type. */
+    --bg: #fdf4e6;          /* page: warm cream */
+    --bg-tint: #f7e8d1;     /* bands, table heads, gutters */
+    --panel: #fffdf8;       /* card: paper */
+    --panel-2: #f9eeda;     /* inset: inputs, chips, wells */
+    --edge: #eddcc0;        /* soft border */
+    --edge-2: #e0c8a4;      /* border with something to say */
+    --text: #4a3728;        /* cocoa */
+    --muted: #8a7461;       /* milky coffee */
+    --accent: #e0714b;      /* terracotta: fills */
+    --accent-ink: #c1552f;  /* terracotta: text and links */
+    --berry: #d4638c;
+    --butter: #f5c451;
+    --good: #2f8055;
+    --bad: #c4443c;
+    --warn: #a06c00;
+    --kitchen: #e0714b;
+    --kitchen-2: #c1552f;
+    /* Chunky offset shadow first, soft warm bloom second: the sticker look. */
+    --shadow: 0 2px 0 #f0dfc4, 0 10px 22px rgba(176, 132, 90, .12);
+    --font: "Nunito", ui-rounded, "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+    --font-display: "Baloo 2", "Nunito", ui-rounded, "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+    --r: 18px;     /* cards and other big soft things */
+    --r-sm: 12px;  /* inputs and small things */
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; color: var(--text);
+    /* A whisper of gingham, so the cream is not flat. */
+    background:
+      repeating-linear-gradient(90deg, rgba(224, 113, 75, .035) 0 24px, transparent 24px 48px),
+      repeating-linear-gradient(0deg, rgba(224, 113, 75, .035) 0 24px, transparent 24px 48px),
+      var(--bg);
+    font: 15.5px/1.6 var(--font);
+  }
+  .wrap { max-width: 1160px; margin: 0 auto; padding: 20px 20px 60px; }
+
+  /* Framed like a photo pinned to a cream wall. The scrim over it is only as
+     dark as the copy needs: the artwork's own left-hand wall is already a warm
+     mid-brown, so anything heavier just puts the room out. */
+  .hero {
+    position: relative; min-height: 278px; margin-bottom: 20px; overflow: hidden;
+    border: 5px solid var(--panel); border-radius: 24px;
+    background:
+      linear-gradient(90deg, rgba(74, 38, 18, .82) 0%, rgba(74, 38, 18, .6) 34%, rgba(74, 38, 18, .12) 66%, rgba(74, 38, 18, 0) 100%),
+      url("/assets/visuals/short-order-hero-warm.png") center right / cover no-repeat;
+    box-shadow: 0 0 0 2px var(--edge-2), 0 16px 36px rgba(176, 132, 90, .3);
+  }
+  .hero-copy { position: relative; z-index: 1; width: min(510px, 60%); padding: 32px 36px 28px; }
+  /* Inside the hero the ground is dark, so these colours are literal rather
+     than the cream-safe tokens above. */
+  .eyebrow {
+    display: inline-block; margin-bottom: 14px; color: var(--butter); font-size: 11.5px;
+    font-weight: 800; letter-spacing: .13em; text-transform: uppercase;
+  }
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 9px; }
+  h1 {
+    font-family: var(--font-display); font-size: clamp(32px, 5vw, 50px);
+    line-height: 1; margin: 0; letter-spacing: -0.015em; color: #fff8ee;
+  }
+  h1 .hat { margin-right: 9px; font-size: .78em; }
+  .lede { max-width: 410px; margin: 0 0 7px; color: #f4e7d6; font-size: 16.5px; }
+  /* `.sub` is used twice over: as the hero's strapline on dark, and as the
+     parenthetical beside a field label on cream. Cream is the default. */
+  .sub { color: var(--muted); font-size: 13.5px; }
+  .hero .sub { color: rgba(255, 247, 236, .74); }
+
+  .env { display: flex; gap: 16px; flex-wrap: wrap; margin: 22px 0 0; font-size: 12.5px; color: rgba(255, 247, 236, .68); }
+  .env span::before { content: "\25CF"; margin-right: 6px; }
+  .env .ok::before { color: #8fe0ac; }
+  .env .no::before { color: #ff9c8c; }
+  @media (max-width: 760px) {
+    .hero { min-height: 320px; background-position: 62% center; }
+    .hero-copy { width: 78%; padding: 28px 24px; }
+  }
+  @media (max-width: 520px) {
+    .hero { min-height: 350px; background-position: 67% center; }
+    .hero-copy { width: 100%; padding: 25px 22px; background: linear-gradient(90deg, rgba(74, 38, 18, .9), rgba(74, 38, 18, .62)); }
+    .lede { max-width: 300px; }
+  }
+
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--panel); border: 2px solid var(--edge); border-radius: var(--r);
+    padding: 20px; min-width: 0; box-shadow: var(--shadow);
+  }
+  .card h2 {
+    font-family: var(--font-display); font-size: 15px; letter-spacing: .02em;
+    color: var(--accent-ink); margin: 0 0 15px; font-weight: 700;
+    padding-bottom: 9px; border-bottom: 2px dashed var(--edge);
+  }
+
+  label { display: block; font-size: 12.5px; color: var(--muted); margin: 0 0 6px; font-weight: 600; }
+  select, input[type=number], input[type=text] {
+    width: 100%; padding: 10px 11px; background: var(--panel); color: var(--text);
+    border: 2px solid var(--edge-2); border-radius: var(--r-sm); font: inherit; font-size: 14.5px;
+  }
+  select:hover, input:hover { border-color: #d3b287; }
+  select:focus, input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(224, 113, 75, .18); }
+  b.best { color: var(--accent-ink); font-weight: 650; }   /* best in its column */
+  /* A rounded jam-coloured tab down the side, instead of a hairline rule. */
+  .accent, .accent-2 { position: relative; padding-left: 15px; }
+  .accent::before, .accent-2::before {
+    content: ""; position: absolute; left: 0; top: 2px; bottom: 2px;
+    width: 5px; border-radius: 3px; background: var(--accent);
+  }
+  .accent-2::before { background: var(--berry); }
+  .row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .field + .field { margin-top: 14px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; min-height: 18px; }
+  .check {
+    display: flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--text);
+    margin-top: 22px; font-weight: 600;
+  }
+  .check input { width: 17px; height: 17px; accent-color: var(--accent); }
+
+  .actions { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-top: 22px; }
+  @media (max-width: 760px) { .actions { grid-template-columns: 1fr; } }
+  button {
+    padding: 13px 15px; border-radius: 14px; border: 2px solid var(--edge-2);
+    background: var(--panel); color: var(--text); font: inherit; font-weight: 700;
+    font-size: 14.5px; cursor: pointer; text-align: left; line-height: 1.3;
+    box-shadow: 0 2px 0 var(--edge-2); transition: transform .1s, box-shadow .1s, border-color .1s;
+  }
+  button:hover:not(:disabled) {
+    border-color: var(--accent); box-shadow: 0 4px 0 #f0c8b4; transform: translateY(-2px);
+  }
+  button:active:not(:disabled) { transform: translateY(1px); box-shadow: 0 1px 0 var(--edge-2); }
+  button:disabled { opacity: 0.5; cursor: progress; }
+  button .hint { display: block; font-weight: 500; font-size: 11.5px; color: var(--muted); margin-top: 4px; min-height: 0; }
+  button.primary {
+    background: var(--kitchen); border-color: var(--kitchen-2); color: #fff8f2;
+    box-shadow: 0 3px 0 var(--kitchen-2);
+  }
+  button.primary .hint { color: rgba(255, 248, 242, .84); }
+  button.primary:hover:not(:disabled) { background: #e8825d; box-shadow: 0 5px 0 var(--kitchen-2); }
+  button.primary:active:not(:disabled) { box-shadow: 0 1px 0 var(--kitchen-2); }
+
+  #status { margin-top: 20px; min-height: 22px; font-size: 14px; font-weight: 700; }
+  #status.err {
+    color: var(--bad); white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace;
+    font-size: 12.5px; font-weight: 500; background: #fdeeec; border: 2px solid #f3cfc9;
+    border-radius: var(--r-sm); padding: 11px 13px;
+  }
+  #status.ok { color: var(--good); }
+  #status.busy { color: var(--accent-ink); }
+
+  .out { margin-top: 18px; display: grid; gap: 16px; }
+  pre {
+    background: var(--panel-2); border: 2px solid var(--edge); border-radius: var(--r-sm);
+    padding: 14px 16px; overflow-x: auto; font-size: 12.5px; line-height: 1.55;
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace; margin: 0;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { padding: 8px 11px; text-align: right; border-bottom: 1px solid var(--edge); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; color: var(--muted); font-weight: 500; }
+  thead th {
+    color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .07em;
+    font-weight: 800; background: var(--panel-2); border-bottom: 2px solid var(--edge-2);
+  }
+  thead th:first-child { border-radius: var(--r-sm) 0 0 0; }
+  thead th:last-child { border-radius: 0 var(--r-sm) 0 0; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tr.yours td { color: var(--accent-ink); font-weight: 800; background: #fdefe7; }
+  tr.yours td:first-child { color: var(--accent-ink); }
+  .tablewrap { overflow-x: auto; }
+
+  .score { display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap; margin: 2px 0 16px; }
+  .score .big {
+    font-family: var(--font-display); font-size: 44px; font-weight: 800;
+    font-variant-numeric: tabular-nums; line-height: 1; color: var(--accent-ink);
+  }
+  .score .big small { font-size: 16px; color: var(--muted); font-weight: 500; margin-left: 4px; }
+  .score .who { color: var(--muted); font-size: 13px; }
+  .bars { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 6px 0 16px; }
+  @media (max-width: 760px) { .bars { grid-template-columns: repeat(2, 1fr); } }
+  .bar { background: var(--panel-2); border: 2px solid var(--edge); border-radius: 14px; padding: 9px 11px; }
+  .bar .k { font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); font-weight: 700; }
+  .bar .v { font-size: 19px; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .bar .v small { font-size: 11px; color: var(--muted); font-weight: 500; }
+  .bar .track { height: 7px; background: #f0dfc4; border-radius: 4px; margin-top: 7px; overflow: hidden; }
+  .bar .fill { height: 100%; background: var(--accent); border-radius: 4px; }
+  .indent td:first-child { padding-left: 26px; color: #a3907c; }
+  .fail { color: var(--bad); font-size: 13px; margin-top: 10px; }
+  .fail li { margin: 3px 0; }
+  a { color: var(--accent-ink); text-decoration: none; font-weight: 600; }
+  a:hover { text-decoration: underline; }
+  .replays { display: flex; flex-wrap: wrap; gap: 9px; }
+  .replays a {
+    background: var(--panel-2); border: 2px solid var(--edge-2); border-radius: 999px;
+    padding: 6px 13px; font-size: 12.5px; color: var(--text);
+  }
+  .replays a:hover { border-color: var(--accent); background: #fdefe7; text-decoration: none; }
+  .badge {
+    display: inline-block; font-size: 11px; padding: 2px 9px; border-radius: 999px;
+    border: 1.5px solid var(--edge-2); background: var(--panel-2); color: var(--muted);
+    margin-left: 6px; vertical-align: 1px; font-weight: 700;
+  }
+  .badge.good { color: var(--good); border-color: #a8d8bd; background: #e9f7ef; }
+  .badge.bad { color: var(--bad); border-color: #f0c4bf; background: #fdeeec; }
+/* the metric hover */
+#metric-tip {
+  position: fixed; z-index: 80; pointer-events: none; max-width: 430px;
+  padding: 11px 14px; border-radius: 14px; font-size: 12.5px; line-height: 1.5;
+  background: rgba(255, 253, 248, .98); border: 2px solid var(--edge-2); border-left: 5px solid var(--accent);
+  box-shadow: 0 12px 30px rgba(122, 88, 58, .26);
+}
+#metric-tip .t { font-weight: 800; font-size: 13.5px; color: var(--text); }
+#metric-tip .f { margin: 5px 0; }
+#metric-tip .f code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--accent-ink); }
+#metric-tip .n { color: var(--muted); }
+[data-metric] { cursor: help; text-decoration: underline dotted rgba(138, 116, 97, .55); text-underline-offset: 3px; }
+/* badges */
+.badges { display: inline-flex; gap: 4px; vertical-align: middle; flex-wrap: wrap; }
+img.sbadge { width: 26px; height: 26px; image-rendering: auto; cursor: help; vertical-align: middle; }
+.badgerow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+.badgerow .lab { color: var(--muted); font-size: 12px; font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <section class="hero" aria-labelledby="page-title">
+    <div class="hero-copy">
+      <span class="eyebrow">CPU scheduling, served differently</span>
+      <header>
+        <h1 id="page-title"><span class="hat" aria-hidden="true">&#x1F468;&#x200D;&#x1F373;</span>Short Order</h1>
+      </header>
+      <p class="lede">A deterministic scheduling lab disguised as a restaurant kitchen.</p>
+      <span class="sub">Pick a scheduler and a service, press a button, then watch the kitchen work.</span>
+      <div class="env" id="env"></div>
+    </div>
+  </section>
+
+  <div class="grid">
+    <div class="card">
+      <h2>🧑‍🍳 Scheduler</h2>
+      <div class="field accent">
+        <label for="scheduler">Scheduler — the policy that decides who cooks what</label>
+        <select id="scheduler"></select>
+        <div class="hint" id="schedulerHint"></div>
+      </div>
+      <div class="field">
+        <label for="speed">Viewer speed</label>
+        <select id="speed">
+          <option value="1">1× (real time)</option>
+          <option value="2">2×</option>
+          <option value="4" selected>4×</option>
+          <option value="8">8×</option>
+          <option value="16">16×</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>🍽️ Service</h2>
+      <div class="field accent-2">
+        <label for="config">Profile — the menu, the load and the rules</label>
+        <select id="config"></select>
+        <div class="hint" id="configHint"></div>
+      </div>
+      <div class="row" style="margin-top:13px">
+        <div>
+          <label for="seed">Seed</label>
+          <input id="seed" type="number" value="1234" min="0">
+        </div>
+        <div>
+          <label for="cores">Cooks <span class="sub">(blank: profile)</span></label>
+          <input id="cores" type="number" min="1" max="16" placeholder="profile">
+        </div>
+        <div>
+          <label for="switchCost">Switch cost <span class="sub">(ticks)</span></label>
+          <input id="switchCost" type="number" min="0" max="100" placeholder="profile">
+        </div>
+      </div>
+      <div class="row" style="margin-top:13px">
+        <div>
+          <label for="seeds">Seeds — for evaluation</label>
+          <input id="seeds" type="number" value="20" min="1" max="500">
+        </div>
+        <div>
+          <label for="ticks">Ticks <span class="sub">(blank: profile)</span></label>
+          <input id="ticks" type="number" min="10" placeholder="profile">
+        </div>
+        <div>
+          <label class="check"><input id="blind" type="checkbox"> Hide durations</label>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="actions">
+    <button class="primary" data-action="play" data-watch="1">
+      Play &amp; watch
+      <span class="hint">Run one service, record it, open it in the kitchen viewer.</span>
+    </button>
+    <button data-action="play" data-watch="0">
+      Play headless
+      <span class="hint">Just the numbers. Fastest way to try a change.</span>
+    </button>
+    <button data-action="evaluate">
+      Evaluate over seeds
+      <span class="hint">Mean score with a confidence interval over a seed set.</span>
+    </button>
+    <button data-action="compare">
+      Compare with references
+      <span class="hint">Your scheduler against every reference scheduler, same seeds.</span>
+    </button>
+    <button data-action="validate">
+      Check submission
+      <span class="hint">The marker's own checks: loads, runs, no exceptions, on time.</span>
+    </button>
+    <button data-action="replays" id="replaysButton">
+      Recent replays
+      <span class="hint">Open something you recorded earlier.</span>
+    </button>
+  </div>
+
+  <div id="status"></div>
+  <div class="out" id="out"></div>
+
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status");
+const outEl = $("out");
+let ENV = null;
+
+function setStatus(text, kind) {
+  statusEl.textContent = text;
+  statusEl.className = kind || "";
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+const pct = (v) => ((v || 0) * 100).toFixed(1) + "%";
+const num = (v, places = 1) => (v === undefined || v === null || Number.isNaN(v)) ? "—" : Number(v).toFixed(places);
+
+// -- environment ------------------------------------------------------------
+
+async function loadEnvironment() {
+  const response = await fetch("/api/environment");
+  const env = await response.json();
+  ENV = env;
+
+  const select = $("scheduler");
+  select.innerHTML = "";
+  const submissions = env.submissions || [];
+  // Your own schedulers first: they are what you came here to watch.
+  if (submissions.length) {
+    const group = document.createElement("optgroup");
+    group.label = "Your schedulers";
+    for (const entry of submissions) group.appendChild(new Option(entry.label, entry.path));
+    select.appendChild(group);
+  }
+  const refs = document.createElement("optgroup");
+  refs.label = "Reference schedulers";
+  for (const b of env.baselines) refs.appendChild(new Option(b.name, b.name));
+  select.appendChild(refs);
+  if (env.examples && env.examples.length) {
+    const examples = document.createElement("optgroup");
+    examples.label = "Examples";
+    for (const entry of env.examples) examples.appendChild(new Option(entry.label, entry.path));
+    select.appendChild(examples);
+  }
+  select.value = submissions.length ? submissions[0].path : "sous_chef";
+  updateSchedulerHint();
+
+  const configs = $("config");
+  configs.innerHTML = "";
+  for (const c of env.configs || []) {
+    const label = c.name ? `${c.name}  ·  ${c.file}` : c.file;
+    configs.appendChild(new Option(label, c.file));
+  }
+  if (!(env.configs || []).length) configs.appendChild(new Option("built-in course profile", "default.toml"));
+  updateConfigHint();
+
+  $("env").innerHTML =
+    `<span class="${env.engine_version ? "ok" : "no"}">engine ${env.engine_version ? escapeHtml(env.engine_version) : escapeHtml(env.engine_error || "missing")}</span>` +
+    `<span class="ok">viewer ready</span>` +
+    `<span class="ok">${env.baselines.length} reference schedulers</span>` +
+    `<span class="ok">${submissions.length} of yours</span>` +
+    `<span class="ok">python ${escapeHtml(env.python || "")}</span>`;
+}
+
+function updateSchedulerHint() {
+  const value = $("scheduler").value;
+  const b = (ENV?.baselines || []).find((x) => x.name === value);
+  $("schedulerHint").textContent = b ? b.description : (value.endsWith(".py") ? value : "");
+}
+
+function updateConfigHint() {
+  const file = $("config").value;
+  const c = (ENV?.configs || []).find((x) => x.file === file);
+  if (!c) { $("configHint").textContent = ""; return; }
+  const facts = c.cores ? ` · ${c.cores} cooks · switch cost ${c.switch_cost} · ${c.max_ticks} ticks${c.known_durations === false ? " · durations hidden" : ""}` : "";
+  $("configHint").textContent = (c.description || "") + facts;
+}
+
+$("scheduler").addEventListener("change", updateSchedulerHint);
+$("config").addEventListener("change", updateConfigHint);
+
+// -- rendering ------------------------------------------------------------
+
+function scoreBars(score) {
+  // The weights travel with the score, so a profile that weighs the five
+  // components differently is drawn to its own scale.
+  const w = score.weights || { completion: 0.3, response: 0.2, slowdown: 0.2, switching: 0.15, fairness: 0.15 };
+  const total = Object.values(w).reduce((a, b) => a + b, 0) || 1;
+  const parts = ["completion", "response", "slowdown", "switching", "fairness"].map((k) => [k, score[k], (w[k] / total) * 100]);
+  return `<div class="bars">${parts.map(([k, v, max]) => `
+    <div class="bar"><div class="k">${k}</div>
+      <div class="v">${(v * max).toFixed(1)}<small> / ${max.toFixed(0)}</small></div>
+      <div class="track"><div class="fill" style="width:${Math.max(0, Math.min(1, v)) * 100}%"></div></div>
+    </div>`).join("")}</div>`;
+}
+
+function shortName(spec) {
+  const text = String(spec);
+  if (!/[\\/]/.test(text)) return text;
+  const parts = text.replace(/\\/g, "/").replace(/:[A-Za-z_]\w*$/, "").split("/");
+  const file = parts.pop() || text;
+  const folder = parts.pop();
+  return file === "scheduler.py" && folder ? folder : file.replace(/\.py$/, "");
+}
+
+function renderResult(result, open) {
+  const m = result.metrics;
+  const capacity = Math.max(1, result.cores) * Math.max(1, result.ticks);
+  const d = result.decision_time_ms || { count: 0, total_ms: 0, max_ms: 0 };
+  const rows = [
+    ["orders", m.orders, `served ${m.served} · abandoned ${m.abandoned} · unfinished ${m.unfinished}`],
+    ["completion", pct(m.completion), `priority-weighted ${pct(m.priority_completion)}`],
+    ["abandoned by priority 1 / 2 / 3", `${m.abandoned_by_priority[1]} / ${m.abandoned_by_priority[2]} / ${m.abandoned_by_priority[3]}`, "", true],
+    ["response mean / p95", `${num(m.response.mean)} / ${num(m.response.p95, 0)} ticks`, `arrival to first tick of work · ${m.never_started ?? 0} never got a cook`],
+    ["turnaround mean / p95", `${num(m.turnaround.mean)} / ${num(m.turnaround.p95, 0)} ticks`, "arrival to served"],
+    ["waiting mean / max", `${num(m.waiting.mean)} / ${num(m.waiting.max, 0)} ticks`, "time on the rail"],
+    ["slowdown mean / max", `${num(m.slowdown.mean, 2)} / ${num(m.slowdown.max, 2)}`, `turnaround ÷ work needed · bounded ${num((m.bounded_slowdown || m.slowdown).mean, 2)} is what is scored`],
+    ["context switches", m.context_switches, `${m.necessary_switches ?? "?"} necessary + ${m.extra_switches ?? "?"} extra · ${m.switch_ticks} ticks (${pct(m.switch_ticks / capacity)} of capacity) · ${m.preemptions} preemptions`],
+    ["utilisation", pct(m.utilisation), `idle ${pct(m.idle_ticks / capacity)} · ${m.wasted_work_ticks} ticks wasted on abandoned orders`],
+    ["fairness (Jain)", num(m.fairness, 3), "1.0 means every order was slowed equally"],
+    ["throughput", `${num(m.throughput, 2)} per 100 ticks`, `makespan ${m.makespan}`],
+    ["decisions", result.decisions, `mean ${num(d.count ? d.total_ms / d.count : 0, 3)} ms · slowest ${num(d.max_ms, 3)} ms · errors ${result.policy_errors} · timeouts ${result.policy_timeouts} · rejected ${result.invalid_assignments}`],
+  ];
+  const failures = (result.failures || []).length
+    ? `<ul class="fail">${result.failures.map((f) => `<li>${escapeHtml(f)}</li>`).join("")}</ul>` : "";
+  const watch = open ? `<a href="${open}" target="_blank">open in the kitchen viewer ↗</a>` : "";
+  return `
+    <div class="card">
+      <div class="score">
+        <div class="big">${result.score.total.toFixed(1)}<small>/ 100</small></div>
+        <div class="who">${escapeHtml(result.policy)} on "${escapeHtml(result.config_name)}" · seed ${result.seed} · ${result.cores} cooks · ended ${escapeHtml(result.terminal_reason)}${result.forfeited ? ' <span class="badge bad">forfeit</span>' : ""}</div>
+        <div style="margin-left:auto">${watch}</div>
+      </div>
+      ${scoreBars(result.score)}
+      <div class="tablewrap"><table>
+        <thead><tr><th></th><th>value</th><th style="text-align:left">notes</th></tr></thead>
+        <tbody>${rows.map(([label, v, note, indent]) =>
+          `<tr class="${indent ? "indent" : ""}"><td>${escapeHtml(label)}</td><td>${escapeHtml(v)}</td><td style="text-align:left;color:var(--muted)">${escapeHtml(note || "")}</td></tr>`).join("")}</tbody>
+      </table></div>
+      ${failures}
+      <p class="sub" style="margin:14px 0 0">${result.ticks} ticks in ${num(result.wall_time_ms)} ms · engine ${escapeHtml(result.engine_version)} · config ${escapeHtml(result.config_hash)}</p>
+    </div>`;
+}
+
+function renderBatch(report) {
+  const s = report.summary || {};
+  if (!s.runs) {
+    return `<div class="card"><p class="fail">No run completed. ${escapeHtml((report.results || []).map((r) => r.platform_error).filter(Boolean).join("; "))}</p></div>`;
+  }
+  const rows = [
+    ["completion", pct(s.completion), `${s.served} of ${s.orders} served · ${s.abandoned} abandoned`],
+    ["response mean / p95", `${num(s.mean_response)} / ${num(s.p95_response)} ticks`, ""],
+    ["turnaround mean", `${num(s.mean_turnaround)} ticks`, ""],
+    ["slowdown mean", num(s.mean_slowdown, 2), `bounded ${num(s.mean_bounded_slowdown, 2)}`],
+    ["switches per run", num(s.context_switches_per_run), `${pct(s.necessary_switch_share ?? 1)} necessary · overhead ${pct(s.overhead)} of capacity · ${num(s.preemptions_per_run)} preemptions`],
+    ["utilisation", pct(s.utilisation), ""],
+    ["fairness (Jain)", num(s.fairness, 3), ""],
+    ["reliability", `errors ${s.policy_errors} · timeouts ${s.policy_timeouts}`, `rejected ${s.invalid_assignments} · forfeits ${s.forfeits}`],
+    ["decision time", `mean ${num(s.decision_mean_ms, 4)} ms`, `slowest ${num(s.decision_max_ms, 3)} ms`],
+  ];
+  const perSeed = (report.results || []).map((r) => r.score?.total ?? 0);
+  const max = Math.max(1, ...perSeed);
+  const spark = `<svg width="100%" height="46" viewBox="0 0 ${perSeed.length * 10} 46" preserveAspectRatio="none" style="display:block">
+    ${perSeed.map((v, i) => `<rect x="${i * 10 + 1}" y="${46 - (v / max) * 44}" width="8" height="${(v / max) * 44}" fill="var(--accent)"><title>seed ${report.seeds[i]}: ${v.toFixed(1)}</title></rect>`).join("")}
+  </svg>`;
+  const failures = (report.results || []).filter((r) => r.platform_error);
+  return `
+    <div class="card">
+      <div class="score">
+        <div class="big">${num(s.mean_score)}<small>± ${num(s.score_ci95)} (95% CI)</small></div>
+        <div class="who">${escapeHtml(report.policy)} on "${escapeHtml(report.config_name)}" over ${s.runs} seeds · min ${num(s.score_min)} · max ${num(s.score_max)}</div>
+      </div>
+      ${scoreBars(s.mean_component_scores)}
+      <div class="sub" style="margin-bottom:4px">score per seed</div>${spark}
+      <div class="tablewrap" style="margin-top:12px"><table>
+        <tbody>${rows.map(([label, v, note]) => `<tr><td>${escapeHtml(label)}</td><td>${escapeHtml(v)}</td><td style="text-align:left;color:var(--muted)">${escapeHtml(note)}</td></tr>`).join("")}</tbody>
+      </table></div>
+      ${failures.length ? `<p class="fail">${failures.length} run(s) failed at the platform level: ${escapeHtml(failures.map((f) => f.platform_error).join("; "))}</p>` : ""}
+      <p class="sub" style="margin:14px 0 0">${report.workers} workers, ${(report.wall_time_ms / 1000).toFixed(1)} s · engine ${escapeHtml(report.engine_version)} · config ${escapeHtml(report.config_hash)}</p>
+    </div>`;
+}
+
+/* ---- what the numbers mean -------------------------------------------------
+   One entry per column heading, as [name, how it is worked out, what it tells
+   you]. The formulas are the ones in sim-core/src/result.rs; if you change
+   them there, change them here. */
+const METRICS = {
+  score: ['score', '100 × Σ(component × weight) ÷ Σ weights',
+    'The six components below, each in [0, 1], multiplied by their weights, added, and divided by the weights own total. Zero if the run was forfeited.'],
+  ci95: ['confidence interval', '1.96 × standard error of the mean over the seeds',
+    'How much of the difference between two schedulers is noise. A gap smaller than this is not a result - run more seeds.'],
+  completion: ['completion', 'served ÷ orders',
+    'The share of customers served before they walked out. Weight 0.30, the largest single component.'],
+  response: ['response', 'mean(first tick of work − arrival), over orders a cook ever started',
+    'How long a customer waits before anything happens at all. Scored as 1 ÷ (1 + mean ÷ 25), so a mean of 25 ticks is half marks. Weight 0.125. This stops at the first tick of work - what happens after it is turnaround.'],
+  slowdown: ['bounded slowdown', 'mean(turnaround ÷ max(the order\'s whole span, 10)), over every order that finished or walked out',
+    'How much longer an order took than the work in it - turnaround, divided. Bounded so a two-tick espresso that waited ten ticks is not counted as a six-fold delay. Scored as 1 ÷ mean, capped at 1. Weight 0.15.'],
+  switches: ['context switches', 'one per dispatch, each costing switch_cost ticks',
+    'Every time a cook takes on an order - from idle or from another order - it loses switch_cost ticks before any work happens.'],
+  necessary: ['necessary switches', 'necessary ÷ total, where necessary = the first dispatch of a work step',
+    'The share of switches any scheduler would have had to pay. 1 means you never resumed a step you had preempted. Weight 0.15.'],
+  fairness: ['fairness', "Jain's index over every order's bounded slowdown - evenness, not welfare",
+    '1 when every customer waited proportionally the same, 1/n when one order took everything. Weight 0.15.'],
+  turnaround: ['turnaround', '1 ÷ (1 + mean(served tick − arrival tick) ÷ 60)',
+    'How long a customer was in the room, start to finish - the wait for a cook, the cooking, every oven wait and every tick back on the rail. A mean of 60 ticks is half marks. Weight 0.125. Where response asks how long before anything happened and slowdown divides by the work in the order, this is the plain absolute number.'],
+  waiting: ['waiting', 'ticks spent on the rail, over every order that finished or walked out',
+    'Time an order sat ready with no cook on it.'],
+  utilisation: ['utilisation', 'work ticks ÷ (cooks × ticks)',
+    'The share of the kitchen that did useful work. What is missing went to switching or to idle cooks.'],
+  overhead: ['overhead', 'switch ticks ÷ (cooks × ticks)',
+    'The share of the kitchen spent switching. This is capacity nobody gets back.'],
+  throughput: ['throughput', 'served × 100 ÷ ticks',
+    'Orders served per hundred ticks.'],
+  makespan: ['makespan', 'the tick the last order was served',
+    'When the kitchen actually finished, as opposed to when service closed.'],
+  preemptions: ['preemptions', 'times an order was taken off a cook mid-step',
+    'The step keeps its progress, but somebody pays another switch to resume it. Each one costs you on the switching component.'],
+  invalid: ['invalid assignments', 'assignments the engine refused',
+    'An order that was in the oven, already served, on another cook - or one whose station was full. The rest of the decision still applied, but the cook you meant to use stayed as it was.'],
+  stations: ['station', 'places taken ÷ (capacity × ticks), and the share of ticks it was full',
+    'A station is a lock with capacity permits. The share of ticks it was full is the share of ticks it was the thing standing in the scheduler’s way.'],
+  ms: ['ms per decision', 'wall-clock time inside schedule()',
+    'Your scheduler’s own speed. A decision slower than the profile’s timeout is discarded and counted against you.'],
+  served: ['served', 'orders finished before the customer left', 'The same figure as completion, as a count.'],
+  abandoned: ['walked out', 'orders whose deadline passed unserved',
+    'Every tick a cook spent on one of these was wasted, however nearly done it was.'],
+};
+
+/* ---- the metric hover -------------------------------------------------------
+   Any element with data-metric="<key>" explains itself on hover. Positioned
+   from JavaScript rather than left to `title`, because a native tooltip takes
+   a second to appear and cannot show the formula on its own line. */
+function installMetricTips(root) {
+  let tip = document.getElementById("metric-tip");
+  if (!tip) {
+    tip = document.createElement("div");
+    tip.id = "metric-tip";
+    tip.hidden = true;
+    document.body.appendChild(tip);
+  }
+  const show = (target, x, y) => {
+    const entry = METRICS[target.dataset.metric];
+    if (!entry) return;
+    tip.innerHTML = `<div class="t">${escapeHtml(entry[0])}</div>`
+      + `<div class="f"><code>${escapeHtml(entry[1])}</code></div>`
+      + `<div class="n">${escapeHtml(entry[2])}</div>`;
+    tip.hidden = false;
+    const box = tip.getBoundingClientRect();
+    let left = x + 14, top = y + 16;
+    if (left + box.width > window.innerWidth - 8) left = x - box.width - 14;
+    if (top + box.height > window.innerHeight - 8) top = y - box.height - 16;
+    tip.style.left = `${Math.max(8, left)}px`;
+    tip.style.top = `${Math.max(8, top)}px`;
+  };
+  (root || document).addEventListener("pointermove", (e) => {
+    const target = e.target.closest ? e.target.closest("[data-metric]") : null;
+    if (target) show(target, e.clientX, e.clientY);
+    else tip.hidden = true;
+  });
+  (root || document).addEventListener("pointerleave", () => { tip.hidden = true; });
+}
+
+/* ---- badges ------------------------------------------------------------
+   32x32 sprites from assets/sprites. A badge that has no file quietly removes
+   itself, so a half-generated set costs nothing and a new reference scheduler
+   can be added before anyone has drawn its shield.
+
+   The sprite filenames are the textbook algorithm names and the keys are the
+   kitchen names: the art is abstract (a toque, a die, two rectangles) and did
+   not change when the references were renamed, so only the keys moved. */
+const BEAT_BADGES = {
+  // Named for the character, matching the art. `work_experience` is the one
+  // still on the old abstract die: the random scheduler was called `maitre_d`
+  // when the set was drawn, and that name has since moved to shortest-job-
+  // first. See assets/sprites/PROMPTS.md.
+  dishwasher: "beat-dishwasher", work_experience: "beat-random",
+  middle_management: "beat-middle-management", headless_chicken: "beat-headless-chicken",
+  maitre_d: "beat-maitre-d", sous_chef: "beat-sous-chef", stickler: "beat-stickler",
+  trainee: "beat-trainee", portion_control: "beat-portion-control",
+  smoke_break: "beat-smoke-break", julia_child: "beat-julia-child",
+  gordon_ramsay: "beat-gordon-ramsay", idiot_sandwich: "beat-idiot-sandwich",
+};
+
+/** The reference schedulers this row out-scored, hardest first. */
+const BEAT_ORDER = ["gordon_ramsay", "julia_child", "maitre_d", "sous_chef",
+                    "portion_control", "work_experience", "trainee", "smoke_break",
+                    "middle_management", "stickler", "headless_chicken",
+                    "idiot_sandwich", "dishwasher"];
+
+function badgeImg(file, title) {
+  return `<img class="sbadge" src="/assets/sprites/${file}.png" alt="${escapeHtml(title)}"`
+    + ` title="${escapeHtml(title)}" onerror="this.remove()">`;
+}
+
+/** The badge strip for one entry: what it beat, then what it led. */
+function badgeStrip(beaten, led) {
+  const parts = [];
+  for (const policy of BEAT_ORDER) {
+    if (beaten.includes(policy) && BEAT_BADGES[policy]) {
+      parts.push(badgeImg(BEAT_BADGES[policy], `beat ${policy.replace(/_/g, " ")}`));
+    }
+  }
+  for (const [file, title] of led) parts.push(badgeImg(file, title));
+  return parts.length ? `<span class="badges">${parts.join("")}</span>` : "";
+}
+
+/** What the comparison says your scheduler earned.
+ *
+ * `compare` runs every reference on the same seeds as yours, so the whole
+ * field is right here: what you beat is a comparison of totals, and what you
+ * led is a comparison of columns. Nothing is awarded for beating nobody. */
+function compareBadges(reports) {
+  const mine = reports.find((r) => r.yours && (r.summary || {}).runs);
+  if (!mine) return "";
+  const field = reports.filter((r) => (r.summary || {}).runs);
+  const s = mine.summary;
+  const beaten = field
+    .filter((r) => !r.yours && (r.summary.mean_score ?? 1e9) < s.mean_score)
+    .map((r) => String(r.policy));
+
+  // Leading a column only counts against a field that is actually there.
+  const best = (pick, lower) => field.every((r) => {
+    const v = pick(r.summary), mineV = pick(s);
+    if (v == null || mineV == null) return true;
+    return r.yours || (lower ? mineV <= v : mineV >= v);
+  });
+  const led = [];
+  if (field.length > 1 && best((x) => x.mean_score, false)) led.push(["best-overall", "top score in the field"]);
+  if (best((x) => x.completion, false)) led.push(["best-completion", "most customers served"]);
+  if (best((x) => x.mean_response, true)) led.push(["best-response", "fastest response"]);
+  if (best((x) => x.mean_turnaround, true)) led.push(["best-turnaround", "shortest turnaround"]);
+  if (best((x) => x.mean_bounded_slowdown ?? x.mean_slowdown, true)) led.push(["best-slowdown", "lowest slowdown"]);
+  if (best((x) => x.necessary_switch_share, false)) led.push(["best-switching", "least wasted switching"]);
+  if (best((x) => x.fairness, false)) led.push(["best-fairness", "fairest kitchen"]);
+
+  const strip = badgeStrip(beaten, led);
+  if (!strip) return "";
+  return `<div class="badgerow"><span class="lab">You earned</span>${strip}</div>`;
+}
+
+/* The best value in each column of the compare table.
+   `lower` says which way is better. The efficiency columns need a completion
+   floor for the same reason the marker's awards do: a scheduler that serves
+   almost nobody has no wait to speak of and barely switches, so `dishwasher`
+   would take response, slowdown, switches and fairness without cooking. */
+const COMPARE_BEST = [
+  ["mean_score", (s) => s.mean_score, false, false],
+  ["completion", (s) => s.completion, false, false],
+  ["mean_response", (s) => s.mean_response, true, true],
+  ["slowdown", (s) => s.mean_bounded_slowdown ?? s.mean_slowdown, true, true],
+  ["switches", (s) => s.context_switches_per_run, true, true],
+  ["necessary", (s) => s.necessary_switch_share ?? 1, false, true],
+  ["fairness", (s) => s.fairness, false, true],
+  ["ms", (s) => s.decision_mean_ms, true, false],
+];
+const MIN_COMPLETION_FOR_BEST = 0.5;
+
+function compareBest(reports) {
+  const best = {};
+  for (const [key, pick, lower, needsCompletion] of COMPARE_BEST) {
+    const values = reports
+      .filter((r) => (r.summary || {}).runs)
+      .filter((r) => !needsCompletion || ((r.summary || {}).completion ?? 0) >= MIN_COMPLETION_FOR_BEST)
+      .map((r) => pick(r.summary || {}))
+      .filter((v) => typeof v === "number" && Number.isFinite(v));
+    if (values.length > 1) best[key] = lower ? Math.min(...values) : Math.max(...values);
+  }
+  return best;
+}
+
+function renderCompare(reports) {
+  const sorted = [...reports].sort((a, b) => ((b.summary || {}).mean_score ?? -1) - ((a.summary || {}).mean_score ?? -1));
+  const best = compareBest(sorted);
+  const rows = sorted.map((r) => {
+    const s = r.summary || {};
+    const cls = r.yours ? "yours" : "";
+    if (!s.runs) return `<tr class="${cls}"><td>${escapeHtml(shortName(r.policy))}</td><td colspan="8">failed</td></tr>`;
+    const cell = (key, text) => {
+      const pick = (COMPARE_BEST.find((c) => c[0] === key) || [])[1];
+      const value = pick ? pick(s) : undefined;
+      return (key in best && value === best[key]) ? `<b class="best">${text}</b>` : text;
+    };
+    return `<tr class="${cls}"><td>${escapeHtml(shortName(r.policy))}${r.yours ? '<span class="badge good">yours</span>' : ""}</td>
+      <td>${cell("mean_score", num(s.mean_score))}</td><td>± ${num(s.score_ci95)}</td><td>${cell("completion", pct(s.completion))}</td>
+      <td>${cell("mean_response", num(s.mean_response))}</td><td>${cell("slowdown", num(s.mean_bounded_slowdown ?? s.mean_slowdown, 2))}</td><td>${cell("switches", num(s.context_switches_per_run))}</td>
+      <td>${cell("necessary", pct(s.necessary_switch_share ?? 1))}</td><td>${cell("fairness", num(s.fairness, 3))}</td><td>${cell("ms", num(s.decision_mean_ms, 3))}</td></tr>`;
+  }).join("");
+  const first = sorted[0] || {};
+  return `
+    <div class="card">
+      <h2>Same seeds, same profile: "${escapeHtml(first.config_name || "")}"</h2>
+      <div class="tablewrap"><table>
+        <thead><tr><th>scheduler</th><th data-metric="score">score</th><th data-metric="ci95">ci95</th>
+          <th data-metric="completion">served</th><th data-metric="response">response</th>
+          <th data-metric="slowdown">slowdown</th><th data-metric="switches">switches</th>
+          <th data-metric="necessary">necessary</th><th data-metric="fairness">fairness</th>
+          <th data-metric="ms">ms/decision</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+      ${compareBadges(sorted)}
+      <p class="sub" style="margin:14px 0 0">A difference smaller than the confidence interval is noise: run more seeds. Hover a badge or a column heading to see what it means.</p>
+    </div>`;
+}
+
+function renderValidation(report) {
+  const stats = Object.entries(report.stats || {}).map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(v)}</td></tr>`).join("");
+  return `
+    <div class="card">
+      <div class="score">
+        <div class="big" style="font-size:26px">${report.ok ? '<span style="color:var(--good)">PASSED</span>' : '<span style="color:var(--bad)">FAILED</span>'}</div>
+        <div class="who">${escapeHtml(report.scheduler || "")}</div>
+      </div>
+      <div class="tablewrap"><table><tbody>${stats}</tbody></table></div>
+      ${(report.errors || []).length ? `<ul class="fail">${report.errors.map((e) => `<li>ERROR: ${escapeHtml(e)}</li>`).join("")}</ul>` : ""}
+      ${(report.warnings || []).length ? `<ul class="fail" style="color:var(--warn)">${report.warnings.map((w) => `<li>warning: ${escapeHtml(w)}</li>`).join("")}</ul>` : ""}
+    </div>`;
+}
+
+function renderReplays(replays) {
+  if (!replays.length) return `<div class="card"><p class="sub">Nothing recorded yet. Press "Play &amp; watch".</p></div>`;
+  const speed = $("speed").value;
+  return `<div class="card"><h2>📽️ Recent replays</h2><div class="replays">${replays.map((r) =>
+    `<a href="/viewer.html?replay=${encodeURIComponent(r.name)}&speed=${speed}" target="_blank" title="${(r.size / 1024).toFixed(0)} KB">${escapeHtml(r.name)}</a>`).join("")}</div></div>`;
+}
+
+// -- launching --------------------------------------------------------------
+
+async function launch(action, watch) {
+  if (action === "replays") {
+    const response = await fetch("/api/replays");
+    const data = await response.json();
+    outEl.innerHTML = renderReplays(data.details || []);
+    return;
+  }
+  const buttons = document.querySelectorAll("button[data-action]");
+  buttons.forEach((b) => (b.disabled = true));
+  setStatus(action === "play" ? "cooking…" : "running…", "busy");
+  try {
+    const response = await fetch("/api/launch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action,
+        watch: watch === "1",
+        scheduler: $("scheduler").value,
+        config: $("config").value,
+        seed: $("seed").value,
+        cores: $("cores").value,
+        switch_cost: $("switchCost").value,
+        ticks: $("ticks").value,
+        blind: $("blind").checked,
+        seeds: $("seeds").value,
+        speed: $("speed").value,
+      }),
+    });
+    const data = await response.json();
+    if (!data.ok) {
+      setStatus(data.error, "err");
+      outEl.innerHTML = "";
+      return;
+    }
+    if (data.kind === "result") outEl.innerHTML = renderResult(data.result, data.open);
+    else if (data.kind === "batch") outEl.innerHTML = renderBatch(data.report);
+    else if (data.kind === "compare") outEl.innerHTML = renderCompare(data.reports);
+    else if (data.kind === "validation") outEl.innerHTML = renderValidation(data.report);
+    else outEl.innerHTML = "";
+    if (data.open) window.open(data.open, "_blank");
+    setStatus(data.message || "done", "ok");
+  } catch (error) {
+    setStatus("could not reach the launcher — is server.py still running?", "err");
+  } finally {
+    buttons.forEach((b) => (b.disabled = false));
+  }
+}
+
+document.querySelectorAll("button[data-action]").forEach((button) => {
+  button.addEventListener("click", () => launch(button.dataset.action, button.dataset.watch));
+});
+
+installMetricTips();
+loadEnvironment().catch(() => setStatus("could not load the environment", "err"));
+</script>
+</body>
+</html>
