@@ -5,6 +5,7 @@ Everything you write goes in here. A submission is one file of code - extra
 so they are rejected rather than silently ignored.
 """
 
+import math
 from kitchen import Decision, Scheduler
 
 
@@ -76,10 +77,6 @@ class MyScheduler(Scheduler):
     def _rank(self, obs, order):
         est = self._estimate(obs, order)
         sc = obs.kitchen.switch_cost
-        slack = order.time_left - est - sc
-        
-        effective_slack = slack - (order.priority - 1) * 50
-        effective_slack = max(effective_slack, 0)
         
         wuw = order.work_until_wait
         if wuw is None:
@@ -88,39 +85,61 @@ class MyScheduler(Scheduler):
         wr = order.work_remaining
         if wr is None:
             wr = est
-            
-        # True SJF: Prioritize by total work remaining, square it to aggressively prefer short jobs
+        
+        # ── Primary: SJF-squared ──
+        wuw = order.work_until_wait
+        if wuw is None:
+            wuw = est
         base = (wr ** 2) * 100 + wuw
         
-        # Prioritize started jobs to reduce turnaround time and slowdown
+        # ── Boost near-completion jobs ──
+        if wr <= 5:
+            base -= 5000000
+        elif wr <= 15:
+            base -= 2000000
+            
+        # ── Prioritize started jobs to reduce turnaround/slowdown ──
         if order.has_started:
             base *= 0.5
-            
-        score = base
         
-        # Tie-breaker is slack
-        score += effective_slack * 0.001
-        
-        # Prevent starvation
+        # ── Fairness correction: bounded slowdown aging ──
+        service = max(order.work_done + wr, 10)
         age = obs.time - order.arrival
-        score -= age * 20
+        current_bounded_slowdown = max(1.0, age / service)
         
-        # Penalize orders that will bump, and boost orders that feed free ovens
+        dampened_slowdown = math.sqrt(current_bounded_slowdown)
+        if base > 0:
+            score = base / dampened_slowdown
+        else:
+            score = base * dampened_slowdown
+        
+        # ── Deadline urgency as tie-breaker ──
+        slack = order.time_left - est - sc
+        effective_slack = slack - (order.priority - 1) * 50
+        score += max(effective_slack, 0) * 0.001
+        
+        # ── Station-awareness & I/O Bound Boost ──
         idx = order.step + 1
-        if idx < len(order.steps):
-            nxt = order.steps[idx]
-            
-            if nxt.kind == "work" and nxt.station is not None:
+        steps = order.steps
+        n_steps = len(steps)
+        if idx < n_steps:
+            nxt = steps[idx]
+            if nxt.station is not None:
                 stn_obj = obs.station(nxt.station)
                 if stn_obj is not None and stn_obj.is_full:
-                    score += 500000
-                    
-            elif nxt.kind == "wait" and nxt.station is not None:
-                stn_obj = obs.station(nxt.station)
-                if stn_obj is not None and not stn_obj.is_full:
-                    # The sooner it reaches the free oven, the bigger the priority boost
-                    boost = max(0, 100 - wuw) * 1000
+                    score += 500000  # Will be blocked or bumped, deprioritize heavily
+        
+        # Manually compute work until wait without triggering properties that copy lists
+        wuw_accum = 0
+        for i in range(order.step, n_steps):
+            s = steps[i]
+            if s.kind == "wait":
+                st = s.station
+                if st is None or (obs.station(st) and not obs.station(st).is_full):
+                    boost = max(0, 100 - wuw_accum) * 500
                     score -= boost
+                break
+            wuw_accum += s.remaining if s.remaining is not None else 0
                     
         return score
 
@@ -147,7 +166,7 @@ class MyScheduler(Scheduler):
         decision = Decision()
         sc = obs.kitchen.switch_cost
         sparse = self._is_sparse(obs)
-        rr_quantum = max(sc * 4, 8)  # round-robin quantum for sparse profiles
+        rr_quantum = max(sc * 20, 60)  # larger quantum to prevent thrashing on sparse profiles
 
         # ===== TRIAGE: separate viable from doomed =====
         viable, doomed = [], []
@@ -187,63 +206,60 @@ class MyScheduler(Scheduler):
             cur = obs.order_on(core)
             if cur is not None and self._is_doomed(obs, cur):
                 # Preempt it if there is ANY viable candidate, or just to free the cook
-                if rest:
-                    cand = rest[0]
-                    decision.assign(core, cand)
-                    a_cores.add(core.id)
-                    a_orders.add(cand.id)
-                    rest.remove(cand)
-                    if cand.station is not None:
-                        free[cand.station] = free.get(cand.station, 0) - 1
-                    if cur.station is not None:
-                        free[cur.station] = free.get(cur.station, 0) + 1
-
-        # ===== PREEMPTION PHASE 2: Mathematically Sound SRTF =====
-        for core in obs.working_cores:
-            if core.id in a_cores or not rest:
-                continue
-            if core.is_switching:
-                continue
-                
-            cur = obs.order_on(core)
-            if cur is None:
-                continue
-                
-            cur_wuw = cur.work_until_wait
-            if cur_wuw is None:
-                cur_wuw = self._estimate(obs, cur)
-                
-            # Find the best candidate to preempt with
-            best_cand = min(rest, key=lambda o: o.work_until_wait or self._estimate(obs, o))
-            cand_wuw = best_cand.work_until_wait or self._estimate(obs, best_cand)
-            
-            # Mathematical condition for preemption to improve average turnaround:
-            # Only preempt for extremely short jobs to preserve necessary switch ratio
-            if cand_wuw <= 5 and cand_wuw + 8 * sc < cur_wuw:
-                # Make sure we don't cause cur to miss its deadline
-                cur_est = self._estimate(obs, cur)
-                if sc + cand_wuw + sc + cur_est <= cur.time_left:
-                    # Make sure the candidate's station is free
-                    st = best_cand.station
+                for cand in rest:
+                    st = cand.station
                     cur_st_bonus = 1 if cur.station == st else 0
                     if st is None or (free.get(st, 0) + cur_st_bonus) > 0:
-                        decision.assign(core, best_cand)
+                        decision.assign(core, cand)
                         a_cores.add(core.id)
-                        a_orders.add(best_cand.id)
-                        rest.remove(best_cand)
-                        if st is not None:
-                            free[st] = free.get(st, 0) - 1
+                        a_orders.add(cand.id)
+                        rest.remove(cand)
+                        if cand.station is not None:
+                            free[cand.station] = free.get(cand.station, 0) - 1
                         if cur.station is not None:
                             free[cur.station] = free.get(cur.station, 0) + 1
+                        break
+
+        # ===== START-UP PHASE (Response Time Minimization) =====
+        # Round-robin UNSTARTED orders so they get an initial response.
+        # Active on sparse profiles and low-switch-cost profiles (banquet-night).
+        if (sparse or sc <= 1) and obs.working_cores:
+            unstarted = [o for o in obs.ready if o.id not in a_orders and not o.has_started]
+            if unstarted:
+                # Preempt ALL cooks that have exceeded the quantum to start unstarted jobs
+                # Use a small quantum to cycle through unstarted jobs rapidly
+                rapid_quantum = max(sc * 2, 4)
+                for core in sorted(obs.working_cores,
+                                   key=lambda c: -c.running_for):
+                    if core.id in a_cores:
+                        continue
+                    if core.running_for < rapid_quantum:
+                        break  # sorted desc — no further cores exceed quantum
+                    if not unstarted:
+                        break
+                    cur = obs.order_on(core)
+                    for o in unstarted:
+                        st = o.station
+                        cur_st_bonus = 1 if cur is not None and cur.station == st else 0
+                        if st is not None and (free.get(st, 0) + cur_st_bonus) <= 0:
+                            continue
+                        if cur is not None and o.id != cur.id:
+                            decision.assign(core, o)
+                            a_cores.add(core.id)
+                            a_orders.add(o.id)
+                            unstarted.remove(o)
+                            if o.station is not None:
+                                free[o.station] = free.get(o.station, 0) - 1
+                            if cur.station is not None:
+                                free[cur.station] = free.get(
+                                    cur.station, 0) + 1
+                            break
 
         # ===== ROUND-ROBIN ON SPARSE PROFILES =====
-        # On function-like profiles (no oven, long jobs, sparse events),
-        # response time (30% weight) and fairness (25% weight) dominate.
-        # Round-robin via wake_in ensures every order gets attention quickly.
+        # For fairness, rotate all jobs slowly on sparse profiles
         if sparse and obs.working_cores:
             unassigned = [o for o in obs.ready if o.id not in a_orders]
             if unassigned:
-                # Preempt ALL cooks that have exceeded the quantum
                 for core in sorted(obs.working_cores,
                                    key=lambda c: -c.running_for):
                     if core.id in a_cores:
@@ -274,17 +290,21 @@ class MyScheduler(Scheduler):
         # Compute the minimum useful wake time from all sources.
         wake = None
 
-        # Source 1: sparse quantum timer (round-robin)
-        if sparse:
+        # Source 1: quantum timers
+        unstarted = [o for o in obs.ready if o.id not in a_orders and not o.has_started]
+        # Use rapid_quantum if we need to start jobs, else rr_quantum if sparse
+        active_quantum = max(sc * 2, 4) if unstarted and (sparse or sc <= 1) else (rr_quantum if sparse else None)
+        
+        if active_quantum is not None:
             if obs.working_cores:
                 max_run = max(c.running_for for c in obs.working_cores)
-                sparse_wake = max(1, rr_quantum - max_run)
+                sparse_wake = max(1, active_quantum - max_run)
             elif obs.busy_cores:
                 # All busy cooks are switching — wake after switch + quantum
                 max_sw = max(c.switch_remaining for c in obs.busy_cores)
-                sparse_wake = max(1, max_sw + rr_quantum)
+                sparse_wake = max(1, max_sw + active_quantum)
             else:
-                sparse_wake = rr_quantum
+                sparse_wake = active_quantum
             wake = sparse_wake
 
         # Source 2: deadline timer — wake before the soonest expiry
