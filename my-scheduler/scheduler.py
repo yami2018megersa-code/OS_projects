@@ -61,16 +61,35 @@ class MyScheduler(Scheduler):
         """
         est = self._estimate(obs, order)
         sc = obs.kitchen.switch_cost
+        
+        wait_time = 0
+        switches_needed = 0
+        last_was_wait = False
+        
+        steps = order.steps
+        for i in range(order.step, len(steps)):
+            s = steps[i]
+            if s.kind == "wait":
+                wait_time += s.remaining if s.remaining is not None else 0
+                last_was_wait = True
+            elif last_was_wait:
+                switches_needed += 1
+                last_was_wait = False
+                
+        # On blind, wait_time is 0 for unknown wait steps because s.remaining is None.
+        # We'll just use what we have.
+        total_time_needed = est + wait_time + (switches_needed * sc)
+        
         # Already running — check if switch is still being paid
         if order.is_running and order.core is not None:
             core = obs.core(order.core)
             if core is not None:
                 if core.is_working:
-                    return est > order.time_left
+                    return total_time_needed > order.time_left
                 if core.is_switching:
-                    return est + core.switch_remaining > order.time_left
+                    return total_time_needed + core.switch_remaining > order.time_left
         # On the rail — needs at least one switch to start
-        return est + sc > order.time_left
+        return total_time_needed + sc > order.time_left
 
     # ---- ranking -----------------------------------------------------------
 
@@ -86,39 +105,30 @@ class MyScheduler(Scheduler):
         if wr is None:
             wr = est
         
-        # ── Primary: SJF-squared ──
-        wuw = order.work_until_wait
-        if wuw is None:
-            wuw = est
-        base = (wr ** 2) * 100 + wuw
+        slack = order.time_left - est - sc
         
-        # ── Boost near-completion jobs ──
+        # 1. Determine Tier (lower is better)
+        # We must finish near-completion jobs first, otherwise at-risk long jobs will preempt them and thrash.
+        tier = 2
         if wr <= 5:
-            base -= 5000000
+            tier = 0
         elif wr <= 15:
-            base -= 2000000
+            tier = 1
             
-        # ── Prioritize started jobs to reduce turnaround/slowdown ──
+        # 2. Base within-tier SJF score
+        base_sjf = (wr ** 2) * 100 + wuw
         if order.has_started:
-            base *= 0.5
-        
-        # ── Fairness correction: bounded slowdown aging ──
+            base_sjf *= 0.5
+            
+        # 3. Fairness scaling
         service = max(order.work_done + wr, 10)
         age = obs.time - order.arrival
         current_bounded_slowdown = max(1.0, age / service)
         
         dampened_slowdown = math.sqrt(current_bounded_slowdown)
-        if base > 0:
-            score = base / dampened_slowdown
-        else:
-            score = base * dampened_slowdown
+        within_tier = base_sjf / dampened_slowdown
         
-        # ── Deadline urgency as tie-breaker ──
-        slack = order.time_left - est - sc
-        effective_slack = slack - (order.priority - 1) * 50
-        score += max(effective_slack, 0) * 0.001
-        
-        # ── Station-awareness & I/O Bound Boost ──
+        # 4. Predictive Station & I/O penalties / boosts
         idx = order.step + 1
         steps = order.steps
         n_steps = len(steps)
@@ -127,9 +137,24 @@ class MyScheduler(Scheduler):
             if nxt.station is not None:
                 stn_obj = obs.station(nxt.station)
                 if stn_obj is not None and stn_obj.is_full:
-                    score += 500000  # Will be blocked or bumped, deprioritize heavily
-        
-        # Manually compute work until wait without triggering properties that copy lists
+                    # Predictive look-ahead: will it free up?
+                    current_step = steps[order.step]
+                    my_rem = current_step.remaining or est
+                    
+                    min_holder_rem = None
+                    for c_id in stn_obj.cores:
+                        c = obs.core(c_id)
+                        if c is not None:
+                            holder = obs.order_on(c)
+                            if holder is not None:
+                                h_step = holder.steps[holder.step]
+                                h_rem = h_step.remaining or self._estimate(obs, holder)
+                                if min_holder_rem is None or h_rem < min_holder_rem:
+                                    min_holder_rem = h_rem
+                    
+                    if min_holder_rem is not None and min_holder_rem > my_rem:
+                        within_tier += 500000
+                    
         wuw_accum = 0
         for i in range(order.step, n_steps):
             s = steps[i]
@@ -137,11 +162,14 @@ class MyScheduler(Scheduler):
                 st = s.station
                 if st is None or (obs.station(st) and not obs.station(st).is_full):
                     boost = max(0, 100 - wuw_accum) * 500
-                    score -= boost
+                    within_tier -= boost
                 break
             wuw_accum += s.remaining if s.remaining is not None else 0
-                    
-        return score
+            
+        # 5. Tiebreakers
+        tiebreaker = slack - (order.priority - 1) * 50
+        
+        return (tier, within_tier, tiebreaker)
 
 
     # ---- profile detection -------------------------------------------------
@@ -224,7 +252,7 @@ class MyScheduler(Scheduler):
         # Round-robin UNSTARTED orders so they get an initial response.
         # Active on sparse profiles and low-switch-cost profiles (banquet-night).
         if (sparse or sc <= 1) and obs.working_cores:
-            unstarted = [o for o in obs.ready if o.id not in a_orders and not o.has_started]
+            unstarted = [o for o in viable if o.id not in a_orders and not o.has_started]
             if unstarted:
                 # Preempt ALL cooks that have exceeded the quantum to start unstarted jobs
                 # Use a small quantum to cycle through unstarted jobs rapidly
@@ -235,30 +263,42 @@ class MyScheduler(Scheduler):
                         continue
                     if core.running_for < rapid_quantum:
                         break  # sorted desc — no further cores exceed quantum
-                    if not unstarted:
-                        break
+                    
                     cur = obs.order_on(core)
+                    if cur is None:
+                        continue
+                        
+                    cur_est = self._estimate(obs, cur)
+                    if cur_est <= sc:
+                        continue  # almost done
+                        
                     for o in unstarted:
+                        o_est = self._estimate(obs, o)
+                        if cur_est <= o_est:
+                            continue
+                            
                         st = o.station
-                        cur_st_bonus = 1 if cur is not None and cur.station == st else 0
+                        cur_st_bonus = 1 if cur.station == st else 0
                         if st is not None and (free.get(st, 0) + cur_st_bonus) <= 0:
                             continue
-                        if cur is not None and o.id != cur.id:
-                            decision.assign(core, o)
-                            a_cores.add(core.id)
-                            a_orders.add(o.id)
-                            unstarted.remove(o)
-                            if o.station is not None:
-                                free[o.station] = free.get(o.station, 0) - 1
-                            if cur.station is not None:
-                                free[cur.station] = free.get(
-                                    cur.station, 0) + 1
-                            break
+                        
+                        decision.assign(core, o)
+                        a_cores.add(core.id)
+                        a_orders.add(o.id)
+                        unstarted.remove(o)
+                        if o.station is not None:
+                            free[o.station] = free.get(o.station, 0) - 1
+                        if cur.station is not None:
+                            free[cur.station] = free.get(cur.station, 0) + 1
+                        break
+                    
+                    if not unstarted:
+                        break
 
         # ===== ROUND-ROBIN ON SPARSE PROFILES =====
         # For fairness, rotate all jobs slowly on sparse profiles
         if sparse and obs.working_cores:
-            unassigned = [o for o in obs.ready if o.id not in a_orders]
+            unassigned = [o for o in viable if o.id not in a_orders]
             if unassigned:
                 for core in sorted(obs.working_cores,
                                    key=lambda c: -c.running_for):
@@ -266,25 +306,37 @@ class MyScheduler(Scheduler):
                         continue
                     if core.running_for < rr_quantum:
                         break  # sorted desc — no further cores exceed quantum
-                    if not unassigned:
-                        break
+                    
                     cur = obs.order_on(core)
+                    if cur is None:
+                        continue
+                        
+                    cur_est = self._estimate(obs, cur)
+                    if cur_est <= sc:
+                        continue  # almost done
+                        
                     for o in unassigned:
+                        o_est = self._estimate(obs, o)
+                        if cur_est <= o_est:
+                            continue
+                            
                         st = o.station
-                        cur_st_bonus = 1 if cur is not None and cur.station == st else 0
+                        cur_st_bonus = 1 if cur.station == st else 0
                         if st is not None and (free.get(st, 0) + cur_st_bonus) <= 0:
                             continue
-                        if cur is not None and o.id != cur.id:
-                            decision.assign(core, o)
-                            a_cores.add(core.id)
-                            a_orders.add(o.id)
-                            unassigned.remove(o)
-                            if o.station is not None:
-                                free[o.station] = free.get(o.station, 0) - 1
-                            if cur.station is not None:
-                                free[cur.station] = free.get(
-                                    cur.station, 0) + 1
-                            break
+                        
+                        decision.assign(core, o)
+                        a_cores.add(core.id)
+                        a_orders.add(o.id)
+                        unassigned.remove(o)
+                        if o.station is not None:
+                            free[o.station] = free.get(o.station, 0) - 1
+                        if cur.station is not None:
+                            free[cur.station] = free.get(cur.station, 0) + 1
+                        break
+                    
+                    if not unassigned:
+                        break
 
         # ===== TIMER =====
         # Compute the minimum useful wake time from all sources.
