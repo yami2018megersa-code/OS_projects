@@ -31,7 +31,7 @@ from kitchen import Decision, Scheduler
 # TUNABLES. Change one at a time and re-run `compare`.
 # --------------------------------------------------------------------------
 LAMBDA = 0.5                # aging strength in the rank key; 0 turns aging off
-AGE_PROMOTE = 1e9           # projected slowdown that promotes an order a tier
+AGE_PROMOTE = 3.0           # projected slowdown that promotes an order a tier
 TIER0_MAX = 5               # remaining work <= this -> tier 0
 TIER1_MAX = 15              # remaining work <= this -> tier 1 (else tier 2)
 RESCUE_SLACK = 0           # viable order with 0 <= slack < this jumps the queue; 0 = off
