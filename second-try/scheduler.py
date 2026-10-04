@@ -30,7 +30,7 @@ from kitchen import Decision, Scheduler
 # --------------------------------------------------------------------------
 # TUNABLES. Change one at a time and re-run `compare`.
 # --------------------------------------------------------------------------
-LAMBDA = 0.5                # aging strength in the rank key; 0 turns aging off
+LAMBDA = 0.15               # aging strength in the rank key; 0 turns aging off
 AGE_PROMOTE = 1e9           # projected slowdown that promotes an order a tier
 TIER0_MAX = 5               # remaining work <= this -> tier 0
 TIER1_MAX = 15              # remaining work <= this -> tier 1 (else tier 2)
@@ -41,7 +41,7 @@ IO_BURST_MAX = 100          # bursts up to this long that lead into an oven step
 IO_FACTOR = 0.5            # rank-key multiplier for those orders (1.0 = no oven preference)
 
 PREEMPT_ENABLED = True
-PREEMPT_MARGIN = 2.0       # hysteresis on the preemption inequality (sweep 1, 2, 4)
+PREEMPT_MARGIN = 3.0       # hysteresis on the preemption inequality (sweep 1, 2, 4)
 PREEMPT_MIN_RUN = 1         # ticks a cook must have worked before it can be taken off
 PREEMPT_CANDIDATES = 6      # how many top-ranked waiting orders are considered
 
@@ -236,7 +236,9 @@ class MyScheduler(Scheduler):
             tier = -1
 
         # Smith's rule for sum(turnaround / span), with aging for evenness.
-        value = rem * span_b / (1.0 + LAMBDA * (ratio - 1.0))
+        # Aging helps short jobs but hurts long ones; fade it out gradually.
+        lambda_eff = LAMBDA * max(0.0, 1.0 - span_b / 120.0)
+        value = rem * span_b / (1.0 + lambda_eff * (ratio - 1.0))
 
         # Will its next step walk into a station that stays full?
         bump = 0
@@ -370,6 +372,8 @@ class MyScheduler(Scheduler):
         """Give unstarted orders a short first turn so response stays low."""
         sc = obs.kitchen.switch_cost
         unstarted = [o for o in viable if o.id not in a_orders and not o.has_started]
+        if not unstarted:
+            return
         quantum = max(sc * 2, FIRST_SLICE_QUANTUM)
         for core in sorted(obs.working_cores, key=lambda c: -c.running_for):
             if not unstarted:
@@ -382,8 +386,8 @@ class MyScheduler(Scheduler):
             if cur is None:
                 continue
             cur_rem = self._prof(obs, cur)[0]
-            if cur_rem <= max(sc, quantum):
-                continue                # it will be done within a slice anyway
+            if cur_rem <= 15:
+                continue                # it will be done soon anyway
             for o in unstarted:
                 if not FIRST_SLICE_ANY_SIZE and cur_rem <= self._prof(obs, o)[0]:
                     continue
